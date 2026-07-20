@@ -1,4 +1,5 @@
-import { CamofoxClient, CamofoxRequestError } from "../camofox/client.js";
+import { CamofoxRequestError } from "../camofox/client.js";
+import type { ReadOnlyBrowserGateway } from "../camofox/read-only-gateway.js";
 import type { CamofoxHealth, CamofoxTab, DisplayResult } from "../camofox/types.js";
 import type { AppConfig } from "../config.js";
 import {
@@ -33,7 +34,7 @@ export class FacebookSessionManager {
   public constructor(
     private readonly config: AppConfig,
     private readonly registry: AccountRepository,
-    private readonly camofox: CamofoxClient,
+    private readonly camofox: ReadOnlyBrowserGateway,
   ) {
     if (!/^[a-zA-Z0-9_-]{1,48}$/.test(config.profilePrefix)) {
       throw new Error("AGENT_PROFILE_PREFIX may only contain letters, digits, underscores and hyphens");

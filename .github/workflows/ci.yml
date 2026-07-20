@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, build, test & audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: TypeScript typecheck
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Tests
+        run: npm test
+
+      - name: Frontend syntax check
+        run: node --check public/app.js
+
+      - name: Security audit (production deps)
+        run: npm audit --omit=dev
+
+      - name: Whitespace / conflict markers
+        run: git diff --check HEAD~ || true

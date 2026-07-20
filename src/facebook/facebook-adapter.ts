@@ -1,4 +1,4 @@
-import { CamofoxClient } from "../camofox/client.js";
+import type { ReadOnlyBrowserGateway } from "../camofox/read-only-gateway.js";
 import type { FacebookAccountAuthState } from "../domain/account.js";
 import type { DiscoveredPostInput, MonitoredGroup } from "../domain/monitoring.js";
 import { FacebookSessionManager } from "../session/facebook-session-manager.js";
@@ -39,7 +39,7 @@ export class FacebookSessionStateError extends Error {
 export class FacebookAdapter {
   public constructor(
     private readonly sessions: FacebookSessionManager,
-    private readonly camofox: CamofoxClient,
+    private readonly camofox: ReadOnlyBrowserGateway,
   ) {}
 
   public async inspectSession(accountId: string): Promise<FacebookSessionInspection> {

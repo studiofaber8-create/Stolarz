@@ -9,6 +9,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest --run",
+    "test:watch": "vitest",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "panel": "node dist/main.js",
@@ -22,6 +24,7 @@
     "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.10"
   }
 }

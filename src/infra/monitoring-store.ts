@@ -1316,166 +1316,56 @@ export class MonitoringStore implements AccountRepository {
     renameSync(legacyPath, `${legacyPath}.migrated-${Date.now()}`);
   }
 
+  public schemaVersion(): number {
+    try {
+      const row = this.database.prepare(
+        "SELECT MAX(version) AS current_version FROM schema_migrations",
+      ).get() as { current_version: number | null } | undefined;
+      return row?.current_version ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
   private migrate(): void {
-    this.transaction(() => {
-      this.database.exec(`
-      CREATE TABLE IF NOT EXISTS accounts (
-        id TEXT PRIMARY KEY,
-        label TEXT NOT NULL,
-        camofox_user_id TEXT NOT NULL UNIQUE,
-        session_key TEXT NOT NULL,
-        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-        auth_state TEXT NOT NULL DEFAULT 'unknown'
-          CHECK(auth_state IN ('unknown','authenticated','login_required','checkpoint','blocked')),
-        recovery_required INTEGER NOT NULL DEFAULT 0 CHECK(recovery_required IN (0, 1)),
-        last_inspected_at TEXT,
-        last_auth_error TEXT,
-        disabled_reason TEXT,
-        recovered_at TEXT,
-        removal_token TEXT,
-        removal_until TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS monitored_groups (
-        id TEXT PRIMARY KEY,
-        account_id TEXT NOT NULL,
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
-        url TEXT NOT NULL UNIQUE,
-        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-        scan_interval_seconds INTEGER NOT NULL,
-        max_posts_per_scan INTEGER NOT NULL,
-        prompt_context TEXT NOT NULL DEFAULT '',
-        last_scanned_at TEXT,
-        next_scan_at TEXT NOT NULL,
-        last_status TEXT NOT NULL CHECK(last_status IN ('never','running','succeeded','failed','auth_required')),
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        applied_at TEXT NOT NULL
       );
-
-      CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK(type = 'scan_group'),
-        group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
-        status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','dead')),
-        attempts INTEGER NOT NULL DEFAULT 0,
-        max_attempts INTEGER NOT NULL DEFAULT 5,
-        available_at TEXT NOT NULL,
-        lease_owner TEXT,
-        lease_until TEXT,
-        lease_token TEXT,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS jobs_claim_idx ON jobs(status, available_at, created_at);
-
-      CREATE TABLE IF NOT EXISTS scan_runs (
-        id TEXT PRIMARY KEY,
-        group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
-        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','auth_required')),
-        posts_seen INTEGER NOT NULL DEFAULT 0,
-        posts_new INTEGER NOT NULL DEFAULT 0,
-        decisions_created INTEGER NOT NULL DEFAULT 0,
-        started_at TEXT NOT NULL,
-        completed_at TEXT,
-        error TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS posts (
-        id TEXT PRIMARY KEY,
-        group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
-        external_id TEXT NOT NULL,
-        url TEXT NOT NULL,
-        author TEXT,
-        content TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        published_at TEXT,
-        discovered_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(group_id, external_id)
-      );
-      CREATE INDEX IF NOT EXISTS posts_discovered_idx ON posts(discovered_at DESC);
-
-      CREATE TABLE IF NOT EXISTS response_templates (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        category TEXT NOT NULL,
-        body TEXT NOT NULL,
-        llm_instruction TEXT NOT NULL DEFAULT '',
-        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS response_templates_category_idx
-        ON response_templates(enabled, category, updated_at DESC);
-
-      CREATE TABLE IF NOT EXISTS lead_decisions (
-        id TEXT PRIMARY KEY,
-        post_id TEXT NOT NULL UNIQUE REFERENCES posts(id) ON DELETE CASCADE,
-        relevant INTEGER NOT NULL CHECK(relevant IN (0, 1)),
-        category TEXT NOT NULL,
-        confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
-        reason TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('ignored','review')),
-        model TEXT NOT NULL,
-        input_tokens INTEGER,
-        output_tokens INTEGER,
-        latency_ms INTEGER NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS response_drafts (
-        id TEXT PRIMARY KEY,
-        decision_id TEXT NOT NULL UNIQUE REFERENCES lead_decisions(id) ON DELETE CASCADE,
-        template_id TEXT REFERENCES response_templates(id) ON DELETE SET NULL,
-        rendered_template TEXT NOT NULL,
-        text TEXT NOT NULL,
-        model TEXT NOT NULL,
-        input_tokens INTEGER,
-        output_tokens INTEGER,
-        latency_ms INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS response_drafts_updated_idx ON response_drafts(updated_at DESC);
-
-      CREATE TABLE IF NOT EXISTS audit_events (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        detail TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_events(created_at DESC);
     `);
-    this.ensureColumn("jobs", "lease_token", "TEXT");
-    this.ensureColumn("accounts", "auth_state", "TEXT NOT NULL DEFAULT 'unknown'");
-    const recoveryRequiredAdded = this.ensureColumn(
-      "accounts",
-      "recovery_required",
-      "INTEGER NOT NULL DEFAULT 0",
-    );
-    this.ensureColumn("accounts", "last_inspected_at", "TEXT");
-    this.ensureColumn("accounts", "last_auth_error", "TEXT");
-    this.ensureColumn("accounts", "disabled_reason", "TEXT");
-    this.ensureColumn("accounts", "recovered_at", "TEXT");
-    this.ensureColumn("accounts", "removal_token", "TEXT");
-    this.ensureColumn("accounts", "removal_until", "TEXT");
-      if (recoveryRequiredAdded) {
-        this.database.prepare(`
-          UPDATE accounts
-          SET recovery_required = 1,
-              disabled_reason = COALESCE(disabled_reason, 'Migrated disabled account requires verification')
-          WHERE enabled = 0
-        `).run();
+    let currentVersion = this.schemaVersion();
+    if (currentVersion === 0) {
+      const hasAccounts = this.database.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'accounts'",
+      ).get();
+      if (hasAccounts !== undefined) {
+        const now = new Date().toISOString();
+        this.database.prepare(
+          "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        ).run(1, "create_base_schema", now);
+        this.ensureColumn("accounts", "auth_state", "TEXT NOT NULL DEFAULT 'unknown'");
+        this.ensureColumn("accounts", "recovery_required", "INTEGER NOT NULL DEFAULT 0");
+        this.ensureColumn("accounts", "last_inspected_at", "TEXT");
+        this.ensureColumn("accounts", "last_auth_error", "TEXT");
+        this.ensureColumn("accounts", "disabled_reason", "TEXT");
+        this.ensureColumn("accounts", "recovered_at", "TEXT");
+        this.ensureColumn("accounts", "removal_token", "TEXT");
+        this.ensureColumn("accounts", "removal_until", "TEXT");
+        this.ensureColumn("jobs", "lease_token", "TEXT");
+        currentVersion = 1;
       }
-    });
+    }
+    for (const migration of MIGRATIONS) {
+      if (migration.version <= currentVersion) continue;
+      this.transaction(() => {
+        migration.up(this.database);
+        this.database.prepare(
+          "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        ).run(migration.version, migration.name, new Date().toISOString());
+      });
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): boolean {
@@ -1485,6 +1375,169 @@ export class MonitoringStore implements AccountRepository {
     return true;
   }
 }
+
+interface Migration {
+  readonly version: number;
+  readonly name: string;
+  up(db: DatabaseSync): void;
+}
+
+const MIGRATIONS: readonly Migration[] = [
+  {
+    version: 1,
+    name: "create_base_schema",
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS accounts (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          camofox_user_id TEXT NOT NULL UNIQUE,
+          session_key TEXT NOT NULL,
+          enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+          auth_state TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(auth_state IN ('unknown','authenticated','login_required','checkpoint','blocked')),
+          recovery_required INTEGER NOT NULL DEFAULT 0 CHECK(recovery_required IN (0, 1)),
+          last_inspected_at TEXT,
+          last_auth_error TEXT,
+          disabled_reason TEXT,
+          recovered_at TEXT,
+          removal_token TEXT,
+          removal_until TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS monitored_groups (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          url TEXT NOT NULL UNIQUE,
+          enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+          scan_interval_seconds INTEGER NOT NULL,
+          max_posts_per_scan INTEGER NOT NULL,
+          prompt_context TEXT NOT NULL DEFAULT '',
+          last_scanned_at TEXT,
+          next_scan_at TEXT NOT NULL,
+          last_status TEXT NOT NULL CHECK(last_status IN ('never','running','succeeded','failed','auth_required')),
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL CHECK(type = 'scan_group'),
+          group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
+          status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','dead')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 5,
+          available_at TEXT NOT NULL,
+          lease_owner TEXT,
+          lease_until TEXT,
+          lease_token TEXT,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS jobs_claim_idx ON jobs(status, available_at, created_at);
+
+        CREATE TABLE IF NOT EXISTS scan_runs (
+          id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','auth_required')),
+          posts_seen INTEGER NOT NULL DEFAULT 0,
+          posts_new INTEGER NOT NULL DEFAULT 0,
+          decisions_created INTEGER NOT NULL DEFAULT 0,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS posts (
+          id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
+          external_id TEXT NOT NULL,
+          url TEXT NOT NULL,
+          author TEXT,
+          content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          published_at TEXT,
+          discovered_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(group_id, external_id)
+        );
+        CREATE INDEX IF NOT EXISTS posts_discovered_idx ON posts(discovered_at DESC);
+
+        CREATE TABLE IF NOT EXISTS response_templates (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          category TEXT NOT NULL,
+          body TEXT NOT NULL,
+          llm_instruction TEXT NOT NULL DEFAULT '',
+          enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS response_templates_category_idx
+          ON response_templates(enabled, category, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS lead_decisions (
+          id TEXT PRIMARY KEY,
+          post_id TEXT NOT NULL UNIQUE REFERENCES posts(id) ON DELETE CASCADE,
+          relevant INTEGER NOT NULL CHECK(relevant IN (0, 1)),
+          category TEXT NOT NULL,
+          confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('ignored','review')),
+          model TEXT NOT NULL,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          latency_ms INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS response_drafts (
+          id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL UNIQUE REFERENCES lead_decisions(id) ON DELETE CASCADE,
+          template_id TEXT REFERENCES response_templates(id) ON DELETE SET NULL,
+          rendered_template TEXT NOT NULL,
+          text TEXT NOT NULL,
+          model TEXT NOT NULL,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          latency_ms INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS response_drafts_updated_idx ON response_drafts(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          detail TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_events(created_at DESC);
+      `);
+    },
+  },
+  {
+    version: 2,
+    name: "backfill_recovery_required_for_disabled_accounts",
+    up(db) {
+      db.prepare(`
+        UPDATE accounts
+        SET recovery_required = 1,
+            disabled_reason = COALESCE(disabled_reason, 'Migrated disabled account requires verification')
+        WHERE enabled = 0 AND recovery_required = 0
+      `).run();
+    },
+  },
+];
 
 function accountFromRow(row: Record<string, SQLOutputValue>): FacebookAccount {
   const lastInspectedAt = nullableString(row.last_inspected_at);
