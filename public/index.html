@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stolarz Agent</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">CAMOFOX CONTROL</p>
+        <h1>Stolarz Agent</h1>
+      </div>
+      <div class="health" id="health"><span class="dot"></span><span>Łączenie…</span></div>
+    </header>
+
+    <main>
+      <section class="auth card hidden" id="auth-card">
+        <div>
+          <h2>Dostęp chroniony</h2>
+          <p>Podaj token panelu skonfigurowany w zmiennej <code>PANEL_API_TOKEN</code>.</p>
+        </div>
+        <form id="token-form" class="inline-form">
+          <input id="token" type="password" autocomplete="current-password" placeholder="Token API panelu" required />
+          <button type="submit">Zapisz token</button>
+        </form>
+      </section>
+
+      <section class="summary-grid">
+        <article class="metric card"><span>Konta</span><strong id="account-count">0</strong></article>
+        <article class="metric card"><span>Aktywne sesje</span><strong id="running-count">0</strong></article>
+        <article class="metric card"><span>Claude LLM</span><strong class="small" id="llm-status">—</strong><button class="secondary" id="test-llm" type="button">Test API</button></article>
+        <article class="metric card"><span>Ostatnie odświeżenie</span><strong class="small" id="refreshed-at">—</strong></article>
+      </section>
+
+      <section class="workspace">
+        <div class="section-heading">
+          <div><p class="eyebrow">PROFILE</p><h2>Autoryzowane konta Facebook</h2></div>
+          <button class="secondary" id="refresh" type="button">Odśwież</button>
+        </div>
+
+        <form id="account-form" class="account-form card">
+          <label>Identyfikator<input name="id" pattern="[a-z0-9_-]{1,48}" placeholder="np. konto-wlasciciela" required /></label>
+          <label>Nazwa konta<input name="label" maxlength="100" placeholder="np. Konto właściciela" required /></label>
+          <button type="submit">Dodaj konto</button>
+        </form>
+
+        <div id="notice" class="notice hidden" role="status"></div>
+        <div id="accounts" class="accounts"></div>
+        <div id="empty" class="empty card">Nie dodano jeszcze żadnego konta.</div>
+      </section>
+    </main>
+
+    <template id="account-template">
+      <article class="account-card card">
+        <div class="account-main">
+          <div class="avatar"></div>
+          <div><h3 class="account-label"></h3><p class="account-meta"></p></div>
+        </div>
+        <div class="session-state"><span class="dot"></span><span class="state-label"></span></div>
+        <div class="account-actions">
+          <button data-action="open" type="button">Otwórz sesję</button>
+          <button data-action="login" class="secondary" type="button">Logowanie noVNC</button>
+          <button data-action="finish" class="secondary" type="button">Zakończ logowanie</button>
+          <button data-action="stop" class="ghost" type="button">Zatrzymaj</button>
+          <button data-action="remove" class="danger ghost" type="button">Usuń wpis</button>
+        </div>
+        <div class="tab-list"></div>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

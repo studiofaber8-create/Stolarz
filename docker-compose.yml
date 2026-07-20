@@ -1,0 +1,48 @@
+services:
+  camofox:
+    image: ${CAMOFOX_IMAGE:-ghcr.io/redf0x1/camofox-browser:latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9377:9377"
+      - "127.0.0.1:6080:6080"
+    environment:
+      CAMOFOX_HOST: 0.0.0.0
+      CAMOFOX_PORT: 9377
+      CAMOFOX_AUTH_MODE: required
+      CAMOFOX_API_KEY: ${CAMOFOX_API_KEY:?Set CAMOFOX_API_KEY}
+      CAMOFOX_HEADLESS: "true"
+      CAMOFOX_MAX_SESSIONS: ${CAMOFOX_MAX_SESSIONS:-20}
+      CAMOFOX_MAX_TABS: ${CAMOFOX_MAX_TABS:-5}
+      CAMOFOX_PROFILES_DIR: /home/node/.camofox/profiles
+      CAMOFOX_VNC_HOST: localhost
+      CAMOFOX_VNC_TIMEOUT_MS: ${CAMOFOX_VNC_TIMEOUT_MS:-600000}
+    volumes:
+      - camofox-data:/home/node/.camofox
+
+  agent:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - camofox
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      CAMOFOX_URL: http://camofox:9377
+      CAMOFOX_API_KEY: ${CAMOFOX_API_KEY:?Set CAMOFOX_API_KEY}
+      AGENT_DATA_DIR: /app/data
+      AGENT_PROFILE_PREFIX: ${AGENT_PROFILE_PREFIX:-stolarz-fb}
+      FACEBOOK_HOME_URL: https://www.facebook.com/
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 3000
+      PANEL_API_TOKEN: ${PANEL_API_TOKEN:?Set PANEL_API_TOKEN}
+      LLM_API_URL: ${LLM_API_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-opus-4-8}
+      LLM_API_FORMAT: ${LLM_API_FORMAT:-anthropic}
+      LLM_ANTHROPIC_VERSION: ${LLM_ANTHROPIC_VERSION:-2023-06-01}
+    volumes:
+      - agent-data:/app/data
+
+volumes:
+  camofox-data:
+  agent-data:
