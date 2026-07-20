@@ -1,8 +1,7 @@
-import { CamofoxClient } from "../camofox/client.js";
+import { CamofoxClient, CamofoxRequestError } from "../camofox/client.js";
 import type { CamofoxHealth, CamofoxTab, DisplayResult } from "../camofox/types.js";
 import type { AppConfig } from "../config.js";
-import { assertAccountId, type FacebookAccount } from "../domain/account.js";
-import { AccountRegistry } from "../infra/account-registry.js";
+import { assertAccountId, type AccountRepository, type FacebookAccount } from "../domain/account.js";
 import { KeyedMutex } from "./keyed-mutex.js";
 
 export interface AccountSessionStatus {
@@ -18,12 +17,17 @@ export interface LoginSessionResult {
   readonly tab: CamofoxTab;
 }
 
+export interface AccountTabContext {
+  readonly account: FacebookAccount;
+  readonly tab: CamofoxTab;
+}
+
 export class FacebookSessionManager {
   private readonly mutex = new KeyedMutex();
 
   public constructor(
     private readonly config: AppConfig,
-    private readonly registry: AccountRegistry,
+    private readonly registry: AccountRepository,
     private readonly camofox: CamofoxClient,
   ) {
     if (!/^[a-zA-Z0-9_-]{1,48}$/.test(config.profilePrefix)) {
@@ -62,18 +66,20 @@ export class FacebookSessionManager {
   }
 
   public async openSession(accountId: string, url = this.config.facebookHomeUrl): Promise<CamofoxTab> {
+    return this.runWithAccountTab(accountId, url, async ({ tab }) => tab);
+  }
+
+  public async runWithAccountTab<T>(
+    accountId: string,
+    url: string,
+    operation: (context: AccountTabContext) => Promise<T>,
+  ): Promise<T> {
     const account = await this.enabledAccount(accountId);
     const safeUrl = facebookUrl(url);
     return this.mutex.runExclusive(account.id, async () => {
       await this.assertHealthy();
-      const existing = await this.camofox.listTabs(account.camofoxUserId);
-      const matchingTab = existing.find((tab) => tab.url === safeUrl);
-      if (matchingTab) return matchingTab;
-      return this.camofox.createTab({
-        userId: account.camofoxUserId,
-        sessionKey: account.sessionKey,
-        url: safeUrl,
-      });
+      const tab = await this.openOrReuseTab(account, safeUrl);
+      return operation({ account, tab });
     });
   }
 
@@ -146,6 +152,26 @@ export class FacebookSessionManager {
     );
   }
 
+  private async openOrReuseTab(account: FacebookAccount, url: string): Promise<CamofoxTab> {
+    const existing = await this.camofox.listTabs(account.camofoxUserId);
+    const selected = existing.find((tab) => tab.url === url) ?? existing[0];
+    if (selected) {
+      await Promise.all(
+        existing
+          .filter((tab) => tab.id !== selected.id)
+          .map((tab) => this.camofox.closeTab(account.camofoxUserId, tab.id)),
+      );
+      if (selected.url === url) return selected;
+      const navigation = await this.camofox.navigate(account.camofoxUserId, selected.id, url);
+      return { ...selected, url: navigation.url ?? url };
+    }
+    return this.camofox.createTab({
+      userId: account.camofoxUserId,
+      sessionKey: account.sessionKey,
+      url,
+    });
+  }
+
   private async enabledAccount(accountId: string): Promise<FacebookAccount> {
     const account = await this.registry.get(accountId);
     if (!account.enabled) throw new Error(`Account is disabled: ${account.id}`);
@@ -158,8 +184,12 @@ export class FacebookSessionManager {
   }
 
   private async closeSessionIfPresent(userId: string): Promise<void> {
-    const tabs = await this.camofox.listTabs(userId);
-    if (tabs.length > 0) await this.camofox.closeSession(userId);
+    try {
+      await this.camofox.closeSession(userId);
+    } catch (error) {
+      if (error instanceof CamofoxRequestError && error.status === 404) return;
+      throw error;
+    }
   }
 }
 

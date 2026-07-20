@@ -11,8 +11,8 @@
     "check": "tsc --noEmit -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "panel": "node dist/panel.js",
-    "panel:dev": "tsx src/panel.ts"
+    "panel": "node dist/main.js",
+    "panel:dev": "tsx src/main.ts"
   },
   "dependencies": {
     "commander": "^14.0.0",

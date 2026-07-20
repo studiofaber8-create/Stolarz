@@ -11,6 +11,15 @@ export interface LlmConfig {
   readonly anthropicVersion: string;
 }
 
+export interface AgentConfig {
+  readonly workerEnabled: boolean;
+  readonly schedulerIntervalMs: number;
+  readonly pollIntervalMs: number;
+  readonly leaseMs: number;
+  readonly reviewThreshold: number;
+  readonly businessDescription: string;
+}
+
 export interface AppConfig {
   readonly camofoxUrl: string;
   readonly camofoxApiKey?: string;
@@ -22,6 +31,7 @@ export interface AppConfig {
   readonly panelPort: number;
   readonly panelApiToken?: string;
   readonly llm?: LlmConfig;
+  readonly agent: AgentConfig;
 }
 
 function positiveInteger(
@@ -39,20 +49,24 @@ function positiveInteger(
   return parsed;
 }
 
+function rangedInteger(
+  name: string,
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const parsed = positiveInteger(name, value, fallback, maximum);
+  if (parsed < minimum) throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+  return parsed;
+}
+
 function parsedUrl(name: string, value: string): URL {
   try {
     return new URL(value);
   } catch {
     throw new Error(`${name} must be a valid URL`);
   }
-}
-
-function normalizedUrl(name: string, value: string): string {
-  const url = parsedUrl(name, value);
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${name} must use http or https`);
-  }
-  return url.toString().replace(/\/$/, "");
 }
 
 function normalizedFacebookUrl(value: string): string {
@@ -88,6 +102,58 @@ function isPrivateHost(hostname: string): boolean {
 function optional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function booleanValue(name: string, value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes"].includes(normalized)) return true;
+  if (["false", "0", "no"].includes(normalized)) return false;
+  throw new Error(`${name} must be true or false`);
+}
+
+function decimalValue(
+  name: string,
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  if (value === undefined || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+  }
+  return parsed;
+}
+
+function agentConfig(env: NodeJS.ProcessEnv): AgentConfig {
+  return {
+    workerEnabled: booleanValue("AGENT_WORKER_ENABLED", env.AGENT_WORKER_ENABLED, true),
+    schedulerIntervalMs: positiveInteger(
+      "AGENT_SCHEDULER_INTERVAL_MS",
+      env.AGENT_SCHEDULER_INTERVAL_MS,
+      30_000,
+    ),
+    pollIntervalMs: positiveInteger("AGENT_WORKER_POLL_MS", env.AGENT_WORKER_POLL_MS, 1_000),
+    leaseMs: rangedInteger(
+      "AGENT_JOB_LEASE_MS",
+      env.AGENT_JOB_LEASE_MS,
+      180_000,
+      3_000,
+      3_600_000,
+    ),
+    reviewThreshold: decimalValue(
+      "AGENT_REVIEW_THRESHOLD",
+      env.AGENT_REVIEW_THRESHOLD,
+      0.8,
+      0,
+      1,
+    ),
+    businessDescription:
+      optional(env.AGENT_BUSINESS_DESCRIPTION) ??
+      "Wykonujemy meble i zabudowy na wymiar: kuchnie, szafy, garderoby i zabudowy stolarskie.",
+  };
 }
 
 function llmConfig(env: NodeJS.ProcessEnv): LlmConfig | undefined {
@@ -128,7 +194,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
 
   const result: AppConfig = {
-    camofoxUrl: normalizedUrl("CAMOFOX_URL", env.CAMOFOX_URL ?? "http://127.0.0.1:9377"),
+    camofoxUrl: normalizedSecretUrl(
+      "CAMOFOX_URL",
+      env.CAMOFOX_URL ?? "http://127.0.0.1:9377",
+    ),
     requestTimeoutMs: positiveInteger(
       "CAMOFOX_REQUEST_TIMEOUT_MS",
       env.CAMOFOX_REQUEST_TIMEOUT_MS,
@@ -141,6 +210,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     panelHost,
     panelPort: positiveInteger("PANEL_PORT", env.PANEL_PORT, 3_000, 65_535),
+    agent: agentConfig(env),
   };
 
   return {

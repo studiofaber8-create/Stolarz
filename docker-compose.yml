@@ -1,6 +1,6 @@
 services:
   camofox:
-    image: ${CAMOFOX_IMAGE:-ghcr.io/redf0x1/camofox-browser:latest}
+    image: ${CAMOFOX_IMAGE:-ghcr.io/redf0x1/camofox-browser:2.4.6}
     restart: unless-stopped
     ports:
       - "127.0.0.1:9377:9377"
@@ -18,19 +18,38 @@ services:
       CAMOFOX_VNC_TIMEOUT_MS: ${CAMOFOX_VNC_TIMEOUT_MS:-600000}
     volumes:
       - camofox-data:/home/node/.camofox
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:9377/health',{headers:{authorization:'Bearer '+process.env.CAMOFOX_API_KEY}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
 
   agent:
     build: .
     restart: unless-stopped
     depends_on:
-      - camofox
+      camofox:
+        condition: service_healthy
     ports:
       - "127.0.0.1:3000:3000"
     environment:
       CAMOFOX_URL: http://camofox:9377
       CAMOFOX_API_KEY: ${CAMOFOX_API_KEY:?Set CAMOFOX_API_KEY}
+      CAMOFOX_REQUEST_TIMEOUT_MS: ${CAMOFOX_REQUEST_TIMEOUT_MS:-30000}
       AGENT_DATA_DIR: /app/data
       AGENT_PROFILE_PREFIX: ${AGENT_PROFILE_PREFIX:-stolarz-fb}
+      AGENT_WORKER_ENABLED: ${AGENT_WORKER_ENABLED:-true}
+      AGENT_SCHEDULER_INTERVAL_MS: ${AGENT_SCHEDULER_INTERVAL_MS:-30000}
+      AGENT_WORKER_POLL_MS: ${AGENT_WORKER_POLL_MS:-1000}
+      AGENT_JOB_LEASE_MS: ${AGENT_JOB_LEASE_MS:-180000}
+      AGENT_REVIEW_THRESHOLD: ${AGENT_REVIEW_THRESHOLD:-0.8}
+      AGENT_BUSINESS_DESCRIPTION: ${AGENT_BUSINESS_DESCRIPTION:-Wykonujemy meble i zabudowy na wymiar.}
       FACEBOOK_HOME_URL: https://www.facebook.com/
       PANEL_HOST: 0.0.0.0
       PANEL_PORT: 3000
@@ -40,8 +59,20 @@ services:
       LLM_MODEL: ${LLM_MODEL:-claude-opus-4-8}
       LLM_API_FORMAT: ${LLM_API_FORMAT:-anthropic}
       LLM_ANTHROPIC_VERSION: ${LLM_ANTHROPIC_VERSION:-2023-06-01}
+      LLM_REQUEST_TIMEOUT_MS: ${LLM_REQUEST_TIMEOUT_MS:-120000}
     volumes:
       - agent-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/api/health',{headers:{authorization:'Bearer '+process.env.PANEL_API_TOKEN}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   camofox-data:

@@ -73,7 +73,7 @@ export class CustomLlmClient {
       const rawText = await response.text();
       if (!response.ok) {
         throw new LlmRequestError(
-          `Custom LLM API returned ${response.status}: ${rawText.slice(0, 1_000)}`,
+          `Custom LLM API returned HTTP ${response.status}`,
           response.status,
         );
       }

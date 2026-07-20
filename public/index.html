@@ -8,19 +8,13 @@
   </head>
   <body>
     <header class="topbar">
-      <div>
-        <p class="eyebrow">CAMOFOX CONTROL</p>
-        <h1>Stolarz Agent</h1>
-      </div>
+      <div><p class="eyebrow">MONITORING AGENT</p><h1>Stolarz Agent</h1></div>
       <div class="health" id="health"><span class="dot"></span><span>Łączenie…</span></div>
     </header>
 
     <main>
       <section class="auth card hidden" id="auth-card">
-        <div>
-          <h2>Dostęp chroniony</h2>
-          <p>Podaj token panelu skonfigurowany w zmiennej <code>PANEL_API_TOKEN</code>.</p>
-        </div>
+        <div><h2>Dostęp chroniony</h2><p>Podaj token z <code>PANEL_API_TOKEN</code>.</p></div>
         <form id="token-form" class="inline-form">
           <input id="token" type="password" autocomplete="current-password" placeholder="Token API panelu" required />
           <button type="submit">Zapisz token</button>
@@ -30,39 +24,89 @@
       <section class="summary-grid">
         <article class="metric card"><span>Konta</span><strong id="account-count">0</strong></article>
         <article class="metric card"><span>Aktywne sesje</span><strong id="running-count">0</strong></article>
-        <article class="metric card"><span>Claude LLM</span><strong class="small" id="llm-status">—</strong><button class="secondary" id="test-llm" type="button">Test API</button></article>
-        <article class="metric card"><span>Ostatnie odświeżenie</span><strong class="small" id="refreshed-at">—</strong></article>
+        <article class="metric card"><span>Grupy</span><strong id="group-count">0</strong></article>
+        <article class="metric card"><span>Joby w kolejce</span><strong id="queued-count">0</strong></article>
+        <article class="metric card"><span>Do przeglądu</span><strong id="review-count">0</strong></article>
+        <article class="metric card"><span>Worker / LLM</span><strong class="small" id="agent-status">—</strong><button class="secondary" id="test-llm" type="button">Test LLM</button></article>
       </section>
+
+      <div id="notice" class="notice hidden" role="status"></div>
 
       <section class="workspace">
         <div class="section-heading">
           <div><p class="eyebrow">PROFILE</p><h2>Autoryzowane konta Facebook</h2></div>
           <button class="secondary" id="refresh" type="button">Odśwież</button>
         </div>
-
-        <form id="account-form" class="account-form card">
-          <label>Identyfikator<input name="id" pattern="[a-z0-9_-]{1,48}" placeholder="np. konto-wlasciciela" required /></label>
-          <label>Nazwa konta<input name="label" maxlength="100" placeholder="np. Konto właściciela" required /></label>
+        <form id="account-form" class="form-grid card">
+          <label>Identyfikator<input name="id" pattern="[a-z0-9_-]{1,48}" placeholder="konto-wlasciciela" required /></label>
+          <label>Nazwa konta<input name="label" maxlength="100" placeholder="Konto właściciela" required /></label>
           <button type="submit">Dodaj konto</button>
         </form>
-
-        <div id="notice" class="notice hidden" role="status"></div>
         <div id="accounts" class="accounts"></div>
-        <div id="empty" class="empty card">Nie dodano jeszcze żadnego konta.</div>
+        <div id="accounts-empty" class="empty card">Nie dodano jeszcze żadnego konta.</div>
+      </section>
+
+      <section class="workspace">
+        <div class="section-heading"><div><p class="eyebrow">ŹRÓDŁA</p><h2>Monitorowane grupy</h2></div></div>
+        <form id="group-form" class="form-grid group-form card">
+          <label>Konto<select name="accountId" id="group-account" required></select></label>
+          <label>Nazwa grupy<input name="name" maxlength="120" required /></label>
+          <label class="wide">URL grupy<input name="url" type="url" placeholder="https://www.facebook.com/groups/..." required /></label>
+          <label>Interwał (min)<input name="intervalMinutes" type="number" min="1" max="1440" value="10" required /></label>
+          <label>Postów / skan<input name="maxPosts" type="number" min="1" max="100" value="20" required /></label>
+          <label class="wide">Kontekst klasyfikacji<input name="promptContext" maxlength="2000" placeholder="Np. Warszawa i okolice" /></label>
+          <button type="submit">Dodaj grupę</button>
+        </form>
+        <div id="groups" class="groups"></div>
+        <div id="groups-empty" class="empty card">Brak skonfigurowanych grup.</div>
+      </section>
+
+      <section class="workspace">
+        <div class="section-heading"><div><p class="eyebrow">ODPOWIEDZI</p><h2>Szablony Spintax + LLM</h2></div></div>
+        <form id="template-form" class="form-grid template-form card">
+          <label>Nazwa<input name="name" maxlength="120" required /></label>
+          <label>Kategoria
+            <select name="category" required>
+              <option value="default">Domyślna</option>
+              <option value="custom_kitchen">Kuchnia na wymiar</option>
+              <option value="wardrobe">Szafa / garderoba</option>
+              <option value="built_in_furniture">Zabudowa</option>
+              <option value="other_custom_furniture">Inne meble</option>
+              <option value="recommendation_request">Prośba o polecenie</option>
+            </select>
+          </label>
+          <label class="wide">Szablon Spintax<textarea name="body" maxlength="10000" placeholder="{Dzień dobry|Witam}, chętnie przygotujemy propozycję." required></textarea></label>
+          <label class="wide">Instrukcja dla LLM<textarea name="llmInstruction" maxlength="2000" placeholder="Krótko, uprzejmie, bez podawania ceny."></textarea></label>
+          <button type="submit">Dodaj szablon</button>
+        </form>
+        <div id="templates" class="groups"></div>
+        <div id="templates-empty" class="empty card">Brak szablonów odpowiedzi.</div>
+      </section>
+
+      <section class="workspace two-columns">
+        <div>
+          <div class="section-heading"><div><p class="eyebrow">LEADY</p><h2>Decyzje do przeglądu</h2></div></div>
+          <div id="decisions" class="feed"></div>
+          <div id="decisions-empty" class="empty card">Brak decyzji wymagających przeglądu.</div>
+        </div>
+        <div>
+          <div class="section-heading"><div><p class="eyebrow">HISTORIA</p><h2>Ostatnie skany</h2></div></div>
+          <div id="scans" class="feed"></div>
+          <div id="scans-empty" class="empty card">Brak wykonanych skanów.</div>
+        </div>
       </section>
     </main>
 
     <template id="account-template">
       <article class="account-card card">
-        <div class="account-main">
-          <div class="avatar"></div>
-          <div><h3 class="account-label"></h3><p class="account-meta"></p></div>
-        </div>
+        <div class="account-main"><div class="avatar"></div><div><h3 class="account-label"></h3><p class="account-meta"></p></div></div>
         <div class="session-state"><span class="dot"></span><span class="state-label"></span></div>
         <div class="account-actions">
           <button data-action="open" type="button">Otwórz sesję</button>
+          <button data-action="inspect" class="secondary" type="button">Sprawdź login</button>
           <button data-action="login" class="secondary" type="button">Logowanie noVNC</button>
           <button data-action="finish" class="secondary" type="button">Zakończ logowanie</button>
+          <button data-action="toggle" class="secondary" type="button">Wyłącz konto</button>
           <button data-action="stop" class="ghost" type="button">Zatrzymaj</button>
           <button data-action="remove" class="danger ghost" type="button">Usuń wpis</button>
         </div>

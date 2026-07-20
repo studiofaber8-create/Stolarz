@@ -10,6 +10,18 @@ export interface FacebookAccount {
   readonly updatedAt: string;
 }
 
+export interface AccountRepository {
+  list(): Promise<FacebookAccount[]>;
+  get(accountId: string): Promise<FacebookAccount>;
+  add(input: {
+    id: string;
+    label: string;
+    camofoxUserId: string;
+    sessionKey: string;
+  }): Promise<FacebookAccount>;
+  remove(accountId: string): Promise<FacebookAccount>;
+}
+
 export function assertAccountId(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!ACCOUNT_ID_PATTERN.test(normalized)) {
