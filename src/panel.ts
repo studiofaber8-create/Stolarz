@@ -10,6 +10,7 @@ import express, {
 } from "express";
 import { CamofoxRequestError } from "./camofox/client.js";
 import type { CamofoxTab } from "./camofox/types.js";
+import { FACEBOOK_EXTRACTOR_VERSION } from "./facebook/facebook-extractor.js";
 import { LlmRequestError } from "./llm/custom-llm-client.js";
 import { createServices, type Services } from "./services.js";
 
@@ -142,6 +143,29 @@ export function createPanelApp(services: Services = createServices()): express.E
       browserConnected: health.browserConnected,
       worker: worker.status(),
       monitoring: store.summary(),
+    });
+  });
+
+  app.get("/api/extraction-health", (_request, response) => {
+    const groups = store.listGroups();
+    const problematicGroups = groups.filter(
+      (group) => group.extractionHealth === "suspected_drift" || group.extractionHealth === "error",
+    );
+    response.json({
+      extractorVersion: FACEBOOK_EXTRACTOR_VERSION,
+      summary: {
+        groups: groups.length,
+        healthy: groups.filter((group) => group.extractionHealth === "healthy").length,
+        empty: groups.filter((group) => group.extractionHealth === "empty").length,
+        suspectedDrift: groups.filter((group) => group.extractionHealth === "suspected_drift").length,
+        error: groups.filter((group) => group.extractionHealth === "error").length,
+        unknown: groups.filter((group) => group.extractionHealth === "unknown").length,
+      },
+      problematicGroups,
+      recentScans: store.listScanRuns(50).filter(
+        (scan) => scan.extractorVersion !== undefined || scan.extractionErrorCategory !== undefined,
+      ),
+      checkedAt: new Date().toISOString(),
     });
   });
 

@@ -3,6 +3,7 @@ import type { AgentConfig } from "../config.js";
 import type { AgentJob, LeadDecision, MonitoredGroup, ScanRun } from "../domain/monitoring.js";
 import {
   FacebookAdapter,
+  FacebookExtractionError,
   FacebookSessionStateError,
 } from "../facebook/facebook-adapter.js";
 import { MonitoringStore } from "../infra/monitoring-store.js";
@@ -140,6 +141,12 @@ export class AgentWorker {
       scan = this.store.startScanRunForJob(group.id, job.id, leaseToken);
       const result = await this.facebook.scanGroup(group);
       counts.postsSeen = result.posts.length;
+      this.store.recordScanExtraction(
+        scan.id,
+        job.id,
+        leaseToken,
+        { ...result.diagnostics, currentUrl: result.currentUrl },
+      );
       for (const discovered of result.posts) {
         if (leaseLost) throw new Error(`Job lease lost: ${job.id}`);
         this.store.assertJobLease(job.id, leaseToken);
@@ -208,7 +215,19 @@ export class AgentWorker {
         }
       }
       if (leaseLost) throw new Error(`Job lease lost: ${job.id}`);
-      this.store.finishSuccessfulScan(scan.id, job.id, leaseToken, counts);
+      const completion = this.store.finishSuccessfulScan(scan.id, job.id, leaseToken, counts);
+      if (completion.extraction?.driftDetected) {
+        this.logger.warn("extractor.drift_suspected", {
+          groupId: group.id,
+          extractorVersion: result.diagnostics.extractorVersion,
+          emptyScanStreak: completion.extraction.emptyScanStreak,
+        });
+      } else if (completion.extraction?.recovered) {
+        this.logger.info("extractor.recovered", {
+          groupId: group.id,
+          extractorVersion: result.diagnostics.extractorVersion,
+        });
+      }
       this.store.recordAudit(
         "scan.succeeded",
         "scan",
@@ -236,6 +255,15 @@ export class AgentWorker {
         return;
       }
       this.store.assertJobLease(job.id, leaseToken);
+      if (error instanceof FacebookExtractionError && scan !== undefined) {
+        this.store.recordScanExtractionFailure(
+          scan.id,
+          job.id,
+          leaseToken,
+          error.extractorVersion,
+          error.category,
+        );
+      }
       const accountAuthState =
         error instanceof FacebookSessionStateError &&
         (error.state === "login_required" || error.state === "checkpoint" || error.state === "blocked")
@@ -258,11 +286,13 @@ export class AgentWorker {
         accountAuthState,
       );
       const auditEvent =
-        suspension === "account"
-          ? "scan.auth_required"
-          : suspension === "group"
-            ? "scan.access_denied"
-            : "scan.failed";
+        error instanceof FacebookExtractionError
+          ? "scan.extraction_failed"
+          : suspension === "account"
+            ? "scan.auth_required"
+            : suspension === "group"
+              ? "scan.access_denied"
+              : "scan.failed";
       this.store.recordAudit(
         auditEvent,
         "job",
@@ -272,11 +302,13 @@ export class AgentWorker {
       this.lastError = message;
       this.jobsProcessed += 1;
       const logEvent =
-        suspension === "account"
-          ? "job.auth_required"
-          : suspension === "group"
-            ? "job.access_denied"
-            : "job.failed";
+        error instanceof FacebookExtractionError
+          ? "job.extraction_failed"
+          : suspension === "account"
+            ? "job.auth_required"
+            : suspension === "group"
+              ? "job.access_denied"
+              : "job.failed";
       this.logger.warn(logEvent, {
         jobId: job.id,
         groupId: job.groupId,

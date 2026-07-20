@@ -18,7 +18,7 @@ describe("schema migrations", () => {
 
   it("creates fresh database at latest version", () => {
     const store = new MonitoringStore(dataDir);
-    expect(store.schemaVersion()).toBe(2);
+    expect(store.schemaVersion()).toBe(3);
     store.close();
   });
 
@@ -26,8 +26,63 @@ describe("schema migrations", () => {
     const store1 = new MonitoringStore(dataDir);
     store1.close();
     const store2 = new MonitoringStore(dataDir);
-    expect(store2.schemaVersion()).toBe(2);
+    expect(store2.schemaVersion()).toBe(3);
     store2.close();
+  });
+
+  it("migrates an existing v2 database with group and scan data to v3", async () => {
+    const v2Store = new MonitoringStore(dataDir);
+    await v2Store.add({
+      id: "v2-account",
+      label: "V2 account",
+      camofoxUserId: "v2-profile",
+      sessionKey: "facebook-main",
+    });
+    const group = v2Store.createGroup({
+      accountId: "v2-account",
+      name: "Preserved V2 group",
+      url: "https://www.facebook.com/groups/v2-fixture",
+      scanIntervalSeconds: 600,
+      maxPostsPerScan: 10,
+    });
+    v2Store.enqueueScanNow(group.id);
+    const claimed = v2Store.claimNextJob("migration-test", 60_000)!;
+    const scan = v2Store.startScanRunForJob(group.id, claimed.id, claimed.leaseToken!);
+    v2Store.close();
+
+    const db = new DatabaseSync(path.join(dataDir, "agent.sqlite"));
+    db.exec(`
+      ALTER TABLE monitored_groups DROP COLUMN extraction_health;
+      ALTER TABLE monitored_groups DROP COLUMN empty_scan_streak;
+      ALTER TABLE monitored_groups DROP COLUMN extractor_version;
+      ALTER TABLE monitored_groups DROP COLUMN last_extraction_at;
+      ALTER TABLE scan_runs DROP COLUMN extractor_version;
+      ALTER TABLE scan_runs DROP COLUMN extraction_auth_state;
+      ALTER TABLE scan_runs DROP COLUMN extraction_current_url;
+      ALTER TABLE scan_runs DROP COLUMN extraction_error_category;
+      ALTER TABLE scan_runs DROP COLUMN snapshot_checks;
+      ALTER TABLE scan_runs DROP COLUMN scroll_rounds;
+      ALTER TABLE scan_runs DROP COLUMN page_error_count;
+      DELETE FROM schema_migrations WHERE version = 3;
+    `);
+    db.close();
+
+    const migrated = new MonitoringStore(dataDir);
+    expect(migrated.schemaVersion()).toBe(3);
+    const preservedGroup = migrated.getGroup(group.id);
+    expect(preservedGroup.name).toBe("Preserved V2 group");
+    expect(preservedGroup.extractionHealth).toBe("unknown");
+    expect(preservedGroup.emptyScanStreak).toBe(0);
+    expect(preservedGroup.extractorVersion).toBeUndefined();
+    const preservedScan = migrated.listScanRuns(10).find((entry) => entry.id === scan.id);
+    expect(preservedScan).toMatchObject({
+      status: "running",
+      snapshotChecks: 0,
+      scrollRounds: 0,
+      pageErrorCount: 0,
+    });
+    expect(preservedScan?.extractorVersion).toBeUndefined();
+    migrated.close();
   });
 
   it("detects legacy schema without schema_migrations table", () => {
@@ -98,7 +153,7 @@ describe("schema migrations", () => {
     db.close();
 
     const store = new MonitoringStore(dataDir);
-    expect(store.schemaVersion()).toBe(2);
+    expect(store.schemaVersion()).toBe(3);
     store.close();
   });
 

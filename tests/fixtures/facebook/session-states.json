@@ -1,0 +1,62 @@
+[
+  {
+    "name": "checkpoint by URL",
+    "url": "https://www.facebook.com/checkpoint/123",
+    "snapshot": "Security check",
+    "expected": "checkpoint"
+  },
+  {
+    "name": "checkpoint in Polish snapshot",
+    "url": "https://www.facebook.com/",
+    "snapshot": "Potwierdź swoją tożsamość, aby kontynuować",
+    "expected": "checkpoint"
+  },
+  {
+    "name": "login in English",
+    "url": "https://www.facebook.com/login/",
+    "snapshot": "Log in to Facebook — Email address or phone number",
+    "expected": "login_required"
+  },
+  {
+    "name": "login in Polish",
+    "url": "https://www.facebook.com/",
+    "snapshot": "Zaloguj się do Facebooka. Adres e-mail lub numer telefonu",
+    "expected": "login_required"
+  },
+  {
+    "name": "blocked with captcha",
+    "url": "https://www.facebook.com/captcha/",
+    "snapshot": "Unusual activity — CAPTCHA",
+    "expected": "blocked"
+  },
+  {
+    "name": "access denied in English",
+    "url": "https://www.facebook.com/groups/private/",
+    "snapshot": "This content isn't available right now",
+    "expected": "access_denied"
+  },
+  {
+    "name": "access denied in Polish",
+    "url": "https://www.facebook.com/groups/private/",
+    "snapshot": "Ta zawartość jest obecnie niedostępna",
+    "expected": "access_denied"
+  },
+  {
+    "name": "authenticated in English",
+    "url": "https://www.facebook.com/",
+    "snapshot": "News Feed — Create a post — Account menu",
+    "expected": "authenticated"
+  },
+  {
+    "name": "authenticated in Polish",
+    "url": "https://www.facebook.com/",
+    "snapshot": "Aktualności — Utwórz post — Menu konta",
+    "expected": "authenticated"
+  },
+  {
+    "name": "ambiguous page",
+    "url": "https://www.facebook.com/groups/example/",
+    "snapshot": "Facebook Groups",
+    "expected": "unknown"
+  }
+]

@@ -2,6 +2,24 @@ export type GroupScanStatus = "never" | "running" | "succeeded" | "failed" | "au
 export type ScanRunStatus = "running" | "succeeded" | "failed" | "auth_required";
 export type DecisionStatus = "ignored" | "review";
 export type JobStatus = "queued" | "running" | "succeeded" | "dead";
+export type ExtractionHealth = "unknown" | "healthy" | "empty" | "suspected_drift" | "error";
+export type RecordedFacebookAuthState =
+  | "unknown"
+  | "authenticated"
+  | "login_required"
+  | "checkpoint"
+  | "blocked"
+  | "access_denied";
+
+export interface ScanExtractionDiagnostics {
+  readonly extractorVersion: string;
+  readonly authState: RecordedFacebookAuthState;
+  readonly currentUrl: string;
+  readonly snapshotChecks: number;
+  readonly scrollRounds: number;
+  readonly postsExtracted: number;
+  readonly pageErrorCount: number;
+}
 
 export interface MonitoredGroup {
   readonly id: string;
@@ -16,6 +34,10 @@ export interface MonitoredGroup {
   readonly nextScanAt: string;
   readonly lastStatus: GroupScanStatus;
   readonly lastError?: string;
+  readonly extractionHealth: ExtractionHealth;
+  readonly emptyScanStreak: number;
+  readonly extractorVersion?: string;
+  readonly lastExtractionAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -138,6 +160,13 @@ export interface ScanRun {
   readonly postsSeen: number;
   readonly postsNew: number;
   readonly decisionsCreated: number;
+  readonly extractorVersion?: string;
+  readonly extractionAuthState?: RecordedFacebookAuthState;
+  readonly extractionCurrentUrl?: string;
+  readonly extractionErrorCategory?: string;
+  readonly snapshotChecks: number;
+  readonly scrollRounds: number;
+  readonly pageErrorCount: number;
   readonly startedAt: string;
   readonly completedAt?: string;
   readonly error?: string;
@@ -170,6 +199,8 @@ export interface MonitoringSummary {
   readonly reviewDecisions: number;
   readonly responseTemplates: number;
   readonly responseDrafts: number;
+  readonly extractionDriftGroups: number;
+  readonly extractionErrorGroups: number;
   readonly lastSuccessfulScanAt?: string;
 }
 

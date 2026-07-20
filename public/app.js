@@ -126,13 +126,30 @@ function renderGroups(groups, accounts) {
     const title = node("div");
     title.append(node("h3", "", group.name), node("p", "account-meta", `${group.accountId} · co ${Math.round(group.scanIntervalSeconds / 60)} min`));
     const state = node("span", `badge ${statusClass(group.lastStatus)}`, group.lastStatus);
-    heading.append(title, state);
+    const extraction = node(
+      "span",
+      `badge ${extractionStatusClass(group.extractionHealth)}`,
+      `ekstrakcja: ${group.extractionHealth}`,
+    );
+    const badges = node("div", "group-badges");
+    badges.append(state, extraction);
+    heading.append(title, badges);
     const url = node("a", "group-url", group.url);
     url.href = group.url;
     url.target = "_blank";
     url.rel = "noopener noreferrer";
-    const details = node("p", "muted", `Następny skan: ${formatDate(group.nextScanAt)} · limit ${group.maxPostsPerScan} postów`);
+    const details = node(
+      "p",
+      "muted",
+      `Następny skan: ${formatDate(group.nextScanAt)} · limit ${group.maxPostsPerScan} postów · ` +
+        `ekstraktor ${group.extractorVersion ?? "—"} · puste skany ${group.emptyScanStreak}`,
+    );
     const error = group.lastError ? node("p", "error-text", group.lastError) : null;
+    const extractionWarning = group.extractionHealth === "suspected_drift"
+      ? node("p", "error-text", "Możliwy drift DOM Facebooka lub dłuższy brak nowych postów: co najmniej 3 zakończone, zalogowane skany były puste po wcześniejszej udanej ekstrakcji.")
+      : group.extractionHealth === "error"
+        ? node("p", "error-text", "Ostatnia próba ekstrakcji zakończyła się błędem. Sprawdź diagnostykę skanu.")
+        : null;
     const actions = node("div", "account-actions");
     actions.append(
       actionButton("scan", "Skanuj teraz"),
@@ -153,6 +170,7 @@ function renderGroups(groups, accounts) {
     transfer.append(target, actionButton("move", "Przenieś grupę", "secondary"));
     card.append(heading, url, details);
     if (error) card.append(error);
+    if (extractionWarning) card.append(extractionWarning);
     card.append(transfer, actions);
     elements.groups.append(card);
   }
@@ -233,6 +251,17 @@ function renderScans(scans, groups) {
       node("div", "scan-line", `${groupMap.get(scan.groupId)?.name ?? scan.groupId} · ${scan.status}`),
       node("p", "muted", `${formatDate(scan.startedAt)} · widziane ${scan.postsSeen}, nowe ${scan.postsNew}, decyzje ${scan.decisionsCreated}`),
     );
+    if (scan.extractorVersion) {
+      card.append(node(
+        "p",
+        "muted",
+        `${scan.extractorVersion} · auth ${scan.extractionAuthState ?? "—"} · ` +
+          `snapshoty ${scan.snapshotChecks} · przewinięcia ${scan.scrollRounds} · błędy strony ${scan.pageErrorCount}`,
+      ));
+    }
+    if (scan.extractionErrorCategory) {
+      card.append(node("p", "error-text", `Błąd ekstraktora: ${scan.extractionErrorCategory}`));
+    }
     if (scan.error) card.append(node("p", "error-text", scan.error));
     elements.scans.append(card);
   }
@@ -268,6 +297,12 @@ function actionButton(action, label, className = "") {
 
 function statusClass(status) {
   return status === "succeeded" ? "success" : status === "failed" || status === "auth_required" ? "failure" : "neutral";
+}
+
+function extractionStatusClass(status) {
+  if (status === "healthy") return "success";
+  if (status === "suspected_drift" || status === "error") return "failure";
+  return "neutral";
 }
 
 function formatDate(value) {

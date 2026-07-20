@@ -16,6 +16,7 @@ import type {
   CreateGroupInput,
   CreateResponseTemplateInput,
   DiscoveredPostInput,
+  ExtractionHealth,
   LeadDecision,
   LeadDecisionInput,
   MonitoredGroup,
@@ -23,11 +24,24 @@ import type {
   ResponseDraft,
   ResponseDraftInput,
   ResponseTemplate,
+  ScanExtractionDiagnostics,
   ScanRun,
   ScanRunStatus,
   StoredPost,
   UpdateResponseTemplateInput,
 } from "../domain/monitoring.js";
+
+export interface ExtractionHealthTransition {
+  readonly health: ExtractionHealth;
+  readonly emptyScanStreak: number;
+  readonly driftDetected: boolean;
+  readonly recovered: boolean;
+}
+
+export interface SuccessfulScanCompletion {
+  readonly scan: ScanRun;
+  readonly extraction?: ExtractionHealthTransition;
+}
 
 export class MonitoringStore implements AccountRepository {
   private readonly database: DatabaseSync;
@@ -396,7 +410,9 @@ export class MonitoringStore implements AccountRepository {
       this.database.prepare(`
         UPDATE monitored_groups
         SET account_id = ?, next_scan_at = ?, last_status = 'never',
-            last_error = NULL, last_scanned_at = NULL, updated_at = ?
+            last_error = NULL, last_scanned_at = NULL, extraction_health = 'unknown',
+            empty_scan_streak = 0, extractor_version = NULL, last_extraction_at = NULL,
+            updated_at = ?
         WHERE id = ?
       `).run(accountId, now, now, groupId);
       return previous;
@@ -557,16 +573,27 @@ export class MonitoringStore implements AccountRepository {
     if (row === undefined) throw new Error(`Job lease lost: ${jobId}`);
   }
 
-  public finishSuccessfulScan(
+  public recordScanExtraction(
     scanId: string,
     jobId: string,
     leaseToken: string,
-    counts: { postsSeen: number; postsNew: number; decisionsCreated: number },
-  ): ScanRun {
+    diagnostics: ScanExtractionDiagnostics,
+  ): void {
     const now = new Date().toISOString();
-    return this.transaction(() => {
+    const extractorVersion = boundedText(
+      "extractorVersion",
+      diagnostics.extractorVersion,
+      1,
+      100,
+    );
+    const currentUrl = facebookUrl(diagnostics.currentUrl, "extraction current URL").toString();
+    const snapshotChecks = boundedInteger("snapshotChecks", diagnostics.snapshotChecks, 0, 100);
+    const scrollRounds = boundedInteger("scrollRounds", diagnostics.scrollRounds, 0, 100);
+    const postsExtracted = boundedInteger("postsExtracted", diagnostics.postsExtracted, 0, 100);
+    const pageErrorCount = boundedInteger("pageErrorCount", diagnostics.pageErrorCount, 0, 10_000);
+    this.transaction(() => {
       const owned = this.database.prepare(`
-        SELECT scan_runs.group_id, monitored_groups.account_id FROM scan_runs
+        SELECT scan_runs.id FROM scan_runs
         INNER JOIN jobs ON jobs.id = scan_runs.job_id
         INNER JOIN monitored_groups ON monitored_groups.id = jobs.group_id
         INNER JOIN accounts ON accounts.id = monitored_groups.account_id
@@ -575,6 +602,140 @@ export class MonitoringStore implements AccountRepository {
           AND monitored_groups.enabled = 1 AND accounts.enabled = 1
       `).get(scanId, jobId, leaseToken, now);
       if (owned === undefined) throw new Error(`Job lease lost: ${jobId}`);
+
+      this.database.prepare(`
+        UPDATE scan_runs
+        SET extractor_version = ?, extraction_auth_state = ?, extraction_current_url = ?,
+            extraction_error_category = NULL, snapshot_checks = ?, scroll_rounds = ?,
+            posts_seen = ?, page_error_count = ?
+        WHERE id = ? AND job_id = ? AND status = 'running'
+      `).run(
+        extractorVersion,
+        diagnostics.authState,
+        currentUrl,
+        snapshotChecks,
+        scrollRounds,
+        postsExtracted,
+        pageErrorCount,
+        scanId,
+        jobId,
+      );
+    });
+  }
+
+  public recordScanExtractionFailure(
+    scanId: string,
+    jobId: string,
+    leaseToken: string,
+    extractorVersion: string,
+    category: string,
+  ): void {
+    const now = new Date().toISOString();
+    const version = boundedText("extractorVersion", extractorVersion, 1, 100);
+    const safeCategory = boundedText("extraction error category", category, 1, 100);
+    const groupId = this.transaction(() => {
+      const owned = this.database.prepare(`
+        SELECT scan_runs.group_id FROM scan_runs
+        INNER JOIN jobs ON jobs.id = scan_runs.job_id
+        INNER JOIN monitored_groups ON monitored_groups.id = jobs.group_id
+        INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+        WHERE scan_runs.id = ? AND scan_runs.job_id = ? AND scan_runs.status = 'running'
+          AND jobs.status = 'running' AND jobs.lease_token = ? AND jobs.lease_until >= ?
+          AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+      `).get(scanId, jobId, leaseToken, now);
+      if (owned === undefined) throw new Error(`Job lease lost: ${jobId}`);
+      const ownedGroupId = requiredString(owned.group_id);
+      this.database.prepare(`
+        UPDATE scan_runs
+        SET extractor_version = ?, extraction_error_category = ?
+        WHERE id = ? AND job_id = ? AND status = 'running'
+      `).run(version, safeCategory, scanId, jobId);
+      this.database.prepare(`
+        UPDATE monitored_groups
+        SET extraction_health = 'error',
+            empty_scan_streak = CASE
+              WHEN extractor_version IS NOT NULL AND extractor_version <> ? THEN 0
+              ELSE empty_scan_streak
+            END,
+            extractor_version = ?, last_extraction_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(version, version, now, now, ownedGroupId);
+      return ownedGroupId;
+    });
+    this.recordAudit(
+      "extractor.failed",
+      "group",
+      groupId,
+      `${version}:${safeCategory}`,
+    );
+  }
+
+  public finishSuccessfulScan(
+    scanId: string,
+    jobId: string,
+    leaseToken: string,
+    counts: { postsSeen: number; postsNew: number; decisionsCreated: number },
+  ): SuccessfulScanCompletion {
+    const now = new Date().toISOString();
+    const result = this.transaction(() => {
+      const owned = this.database.prepare(`
+        SELECT scan_runs.group_id, scan_runs.extractor_version,
+          scan_runs.extraction_auth_state, monitored_groups.account_id,
+          monitored_groups.empty_scan_streak, monitored_groups.extraction_health,
+          monitored_groups.extractor_version AS group_extractor_version
+        FROM scan_runs
+        INNER JOIN jobs ON jobs.id = scan_runs.job_id
+        INNER JOIN monitored_groups ON monitored_groups.id = jobs.group_id
+        INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+        WHERE scan_runs.id = ? AND scan_runs.job_id = ? AND scan_runs.status = 'running'
+          AND jobs.status = 'running' AND jobs.lease_token = ? AND jobs.lease_until >= ?
+          AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+      `).get(scanId, jobId, leaseToken, now);
+      if (owned === undefined) throw new Error(`Job lease lost: ${jobId}`);
+      const groupId = requiredString(owned.group_id);
+      const extractorVersion = nullableString(owned.extractor_version);
+      const extractionAuthState = nullableString(owned.extraction_auth_state);
+      let extraction: ExtractionHealthTransition | undefined;
+
+      if (extractorVersion !== undefined && extractionAuthState !== undefined) {
+        const previousHealth = requiredString(owned.extraction_health) as ExtractionHealth;
+        const previousVersion = nullableString(owned.group_extractor_version);
+        const sameVersion = previousVersion === extractorVersion;
+        const previousStreak = sameVersion ? numeric(owned.empty_scan_streak) : 0;
+        const authenticated = extractionAuthState === "authenticated";
+        const hadKnownGoodExtraction = this.database.prepare(`
+          SELECT 1 FROM scan_runs
+          WHERE group_id = ? AND status = 'succeeded' AND extractor_version = ?
+            AND posts_seen > 0 AND id <> ?
+          LIMIT 1
+        `).get(groupId, extractorVersion, scanId) !== undefined;
+        const emptyScanStreak = authenticated
+          ? counts.postsSeen > 0 ? 0 : previousStreak + 1
+          : previousStreak;
+        const health: ExtractionHealth = !authenticated
+          ? "unknown"
+          : counts.postsSeen > 0
+            ? "healthy"
+            : emptyScanStreak >= 3 && hadKnownGoodExtraction
+              ? "suspected_drift"
+              : "empty";
+        const wasDrifted = sameVersion && hadKnownGoodExtraction && (
+          previousHealth === "suspected_drift" || previousStreak >= 3
+        );
+        extraction = {
+          health,
+          emptyScanStreak,
+          driftDetected: health === "suspected_drift" && !wasDrifted,
+          recovered: health === "healthy" && wasDrifted,
+        };
+        this.database.prepare(`
+          UPDATE monitored_groups
+          SET extraction_health = ?, empty_scan_streak = ?, extractor_version = ?,
+              last_extraction_at = ?, updated_at = ?
+          WHERE id = ?
+        `).run(health, emptyScanStreak, extractorVersion, now, now, groupId);
+      }
+
       this.database.prepare(`
         UPDATE scan_runs
         SET status = 'succeeded', posts_seen = ?, posts_new = ?, decisions_created = ?,
@@ -585,7 +746,7 @@ export class MonitoringStore implements AccountRepository {
         UPDATE monitored_groups
         SET last_status = 'succeeded', last_error = NULL, last_scanned_at = ?, updated_at = ?
         WHERE id = ?
-      `).run(now, now, requiredString(owned.group_id));
+      `).run(now, now, groupId);
       this.database.prepare(`
         UPDATE accounts
         SET auth_state = 'authenticated', last_inspected_at = ?, last_auth_error = NULL,
@@ -598,8 +759,26 @@ export class MonitoringStore implements AccountRepository {
         WHERE id = ? AND status = 'running' AND lease_token = ? AND lease_until >= ?
       `).run(now, jobId, leaseToken, now);
       if (completed.changes === 0) throw new Error(`Job lease lost: ${jobId}`);
-      return this.getScanRun(scanId);
+      return { scan: this.getScanRun(scanId), extraction, groupId, extractorVersion };
     });
+
+    if (result.extraction?.driftDetected) {
+      this.recordAudit(
+        "extractor.drift_suspected",
+        "group",
+        result.groupId,
+        `${result.extractorVersion}: ${result.extraction.emptyScanStreak} consecutive successful ` +
+          "authenticated scans without posts after an earlier successful extraction",
+      );
+    } else if (result.extraction?.recovered) {
+      this.recordAudit(
+        "extractor.recovered",
+        "group",
+        result.groupId,
+        result.extractorVersion,
+      );
+    }
+    return { scan: result.scan, ...(result.extraction === undefined ? {} : { extraction: result.extraction }) };
   }
 
   public finishFailedScanAndJob(
@@ -1198,6 +1377,10 @@ export class MonitoringStore implements AccountRepository {
         (SELECT COUNT(*) FROM lead_decisions WHERE status = 'review') AS review_decisions,
         (SELECT COUNT(*) FROM response_templates) AS response_templates,
         (SELECT COUNT(*) FROM response_drafts) AS response_drafts,
+        (SELECT COUNT(*) FROM monitored_groups WHERE extraction_health = 'suspected_drift')
+          AS extraction_drift_groups,
+        (SELECT COUNT(*) FROM monitored_groups WHERE extraction_health = 'error')
+          AS extraction_error_groups,
         (SELECT MAX(completed_at) FROM scan_runs WHERE status = 'succeeded') AS last_successful_scan_at
     `).get();
     if (counts === undefined) throw new Error("Failed to calculate monitoring summary");
@@ -1212,6 +1395,8 @@ export class MonitoringStore implements AccountRepository {
       reviewDecisions: numeric(counts.review_decisions),
       responseTemplates: numeric(counts.response_templates),
       responseDrafts: numeric(counts.response_drafts),
+      extractionDriftGroups: numeric(counts.extraction_drift_groups),
+      extractionErrorGroups: numeric(counts.extraction_error_groups),
       ...(lastSuccessfulScanAt === undefined ? {} : { lastSuccessfulScanAt }),
     };
   }
@@ -1341,19 +1526,20 @@ export class MonitoringStore implements AccountRepository {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'accounts'",
       ).get();
       if (hasAccounts !== undefined) {
-        const now = new Date().toISOString();
-        this.database.prepare(
-          "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-        ).run(1, "create_base_schema", now);
-        this.ensureColumn("accounts", "auth_state", "TEXT NOT NULL DEFAULT 'unknown'");
-        this.ensureColumn("accounts", "recovery_required", "INTEGER NOT NULL DEFAULT 0");
-        this.ensureColumn("accounts", "last_inspected_at", "TEXT");
-        this.ensureColumn("accounts", "last_auth_error", "TEXT");
-        this.ensureColumn("accounts", "disabled_reason", "TEXT");
-        this.ensureColumn("accounts", "recovered_at", "TEXT");
-        this.ensureColumn("accounts", "removal_token", "TEXT");
-        this.ensureColumn("accounts", "removal_until", "TEXT");
-        this.ensureColumn("jobs", "lease_token", "TEXT");
+        this.transaction(() => {
+          this.ensureColumn("accounts", "auth_state", "TEXT NOT NULL DEFAULT 'unknown'");
+          this.ensureColumn("accounts", "recovery_required", "INTEGER NOT NULL DEFAULT 0");
+          this.ensureColumn("accounts", "last_inspected_at", "TEXT");
+          this.ensureColumn("accounts", "last_auth_error", "TEXT");
+          this.ensureColumn("accounts", "disabled_reason", "TEXT");
+          this.ensureColumn("accounts", "recovered_at", "TEXT");
+          this.ensureColumn("accounts", "removal_token", "TEXT");
+          this.ensureColumn("accounts", "removal_until", "TEXT");
+          this.ensureColumn("jobs", "lease_token", "TEXT");
+          this.database.prepare(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+          ).run(1, "create_base_schema", new Date().toISOString());
+        });
         currentVersion = 1;
       }
     }
@@ -1537,6 +1723,26 @@ const MIGRATIONS: readonly Migration[] = [
       `).run();
     },
   },
+  {
+    version: 3,
+    name: "add_extraction_diagnostics",
+    up(db) {
+      db.exec(`
+        ALTER TABLE monitored_groups ADD COLUMN extraction_health TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE monitored_groups ADD COLUMN empty_scan_streak INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE monitored_groups ADD COLUMN extractor_version TEXT;
+        ALTER TABLE monitored_groups ADD COLUMN last_extraction_at TEXT;
+
+        ALTER TABLE scan_runs ADD COLUMN extractor_version TEXT;
+        ALTER TABLE scan_runs ADD COLUMN extraction_auth_state TEXT;
+        ALTER TABLE scan_runs ADD COLUMN extraction_current_url TEXT;
+        ALTER TABLE scan_runs ADD COLUMN extraction_error_category TEXT;
+        ALTER TABLE scan_runs ADD COLUMN snapshot_checks INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE scan_runs ADD COLUMN scroll_rounds INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE scan_runs ADD COLUMN page_error_count INTEGER NOT NULL DEFAULT 0;
+      `);
+    },
+  },
 ];
 
 function accountFromRow(row: Record<string, SQLOutputValue>): FacebookAccount {
@@ -1564,6 +1770,8 @@ function accountFromRow(row: Record<string, SQLOutputValue>): FacebookAccount {
 function groupFromRow(row: Record<string, SQLOutputValue>): MonitoredGroup {
   const lastScannedAt = nullableString(row.last_scanned_at);
   const lastError = nullableString(row.last_error);
+  const extractorVersion = nullableString(row.extractor_version);
+  const lastExtractionAt = nullableString(row.last_extraction_at);
   return {
     id: requiredString(row.id),
     accountId: requiredString(row.account_id),
@@ -1577,6 +1785,10 @@ function groupFromRow(row: Record<string, SQLOutputValue>): MonitoredGroup {
     nextScanAt: requiredString(row.next_scan_at),
     lastStatus: requiredString(row.last_status) as MonitoredGroup["lastStatus"],
     ...(lastError === undefined ? {} : { lastError }),
+    extractionHealth: requiredString(row.extraction_health) as ExtractionHealth,
+    emptyScanStreak: numeric(row.empty_scan_streak),
+    ...(extractorVersion === undefined ? {} : { extractorVersion }),
+    ...(lastExtractionAt === undefined ? {} : { lastExtractionAt }),
     createdAt: requiredString(row.created_at),
     updatedAt: requiredString(row.updated_at),
   };
@@ -1608,6 +1820,10 @@ function jobFromRow(row: Record<string, SQLOutputValue>): AgentJob {
 function scanFromRow(row: Record<string, SQLOutputValue>): ScanRun {
   const completedAt = nullableString(row.completed_at);
   const error = nullableString(row.error);
+  const extractorVersion = nullableString(row.extractor_version);
+  const extractionAuthState = nullableString(row.extraction_auth_state);
+  const extractionCurrentUrl = nullableString(row.extraction_current_url);
+  const extractionErrorCategory = nullableString(row.extraction_error_category);
   return {
     id: requiredString(row.id),
     groupId: requiredString(row.group_id),
@@ -1616,6 +1832,15 @@ function scanFromRow(row: Record<string, SQLOutputValue>): ScanRun {
     postsSeen: numeric(row.posts_seen),
     postsNew: numeric(row.posts_new),
     decisionsCreated: numeric(row.decisions_created),
+    ...(extractorVersion === undefined ? {} : { extractorVersion }),
+    ...(extractionAuthState === undefined
+      ? {}
+      : { extractionAuthState: extractionAuthState as NonNullable<ScanRun["extractionAuthState"]> }),
+    ...(extractionCurrentUrl === undefined ? {} : { extractionCurrentUrl }),
+    ...(extractionErrorCategory === undefined ? {} : { extractionErrorCategory }),
+    snapshotChecks: numeric(row.snapshot_checks),
+    scrollRounds: numeric(row.scroll_rounds),
+    pageErrorCount: numeric(row.page_error_count),
     startedAt: requiredString(row.started_at),
     ...(completedAt === undefined ? {} : { completedAt }),
     ...(error === undefined ? {} : { error }),

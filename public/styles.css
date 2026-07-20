@@ -69,6 +69,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 1.2rem 1.5rem 4rem; }
 .tab-list:not(:empty) { padding: .7rem; background: #0f1310; border-radius: 9px; }
 .group-card { padding: 1rem; display: grid; gap: .7rem; }
 .group-heading { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
+.group-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
 .group-url { font-size: .78rem; overflow-wrap: anywhere; }
 .group-transfer { display: flex; gap: .55rem; align-items: center; }
 .group-transfer select { margin: 0; max-width: 360px; }

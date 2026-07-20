@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -41,4 +43,12 @@ jobs:
         run: npm audit --omit=dev
 
       - name: Whitespace / conflict markers
-        run: git diff --check HEAD~ || true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git diff --check "${BASE_SHA}...HEAD"
+          else
+            EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+            git diff --check "${EMPTY_TREE}" HEAD
+          fi
