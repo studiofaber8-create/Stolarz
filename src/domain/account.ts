@@ -1,13 +1,31 @@
 export const ACCOUNT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{0,46}[a-z0-9])?$/;
 
+export type FacebookAccountAuthState =
+  | "unknown"
+  | "authenticated"
+  | "login_required"
+  | "checkpoint"
+  | "blocked";
+
 export interface FacebookAccount {
   readonly id: string;
   readonly label: string;
   readonly camofoxUserId: string;
   readonly sessionKey: string;
   readonly enabled: boolean;
+  readonly authState: FacebookAccountAuthState;
+  readonly recoveryRequired: boolean;
+  readonly lastInspectedAt?: string;
+  readonly lastAuthError?: string;
+  readonly disabledReason?: string;
+  readonly recoveredAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export interface AccountRemovalLease {
+  readonly account: FacebookAccount;
+  readonly token: string;
 }
 
 export interface AccountRepository {
@@ -19,7 +37,14 @@ export interface AccountRepository {
     camofoxUserId: string;
     sessionKey: string;
   }): Promise<FacebookAccount>;
-  remove(accountId: string): Promise<FacebookAccount>;
+  recordInspection(
+    accountId: string,
+    state: FacebookAccountAuthState,
+    reason: string,
+  ): Promise<FacebookAccount>;
+  beginRemoval(accountId: string, leaseMs: number): Promise<AccountRemovalLease>;
+  cancelRemoval(accountId: string, token: string): Promise<void>;
+  remove(accountId: string, token: string): Promise<FacebookAccount>;
 }
 
 export function assertAccountId(value: string): string {

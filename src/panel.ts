@@ -18,6 +18,10 @@ interface AccountBody {
   readonly label?: unknown;
 }
 
+interface GroupAccountBody {
+  readonly accountId?: unknown;
+}
+
 interface OpenBody {
   readonly url?: unknown;
 }
@@ -176,6 +180,7 @@ export function createPanelApp(services: Services = createServices()): express.E
       recentDecisions: store.listDecisions(50),
       responseTemplates: store.listResponseTemplates(),
       responseDrafts: store.listResponseDrafts(50),
+      recentAudit: store.listAuditEvents(50),
       refreshedAt: new Date().toISOString(),
     });
   });
@@ -214,6 +219,15 @@ export function createPanelApp(services: Services = createServices()): express.E
     response.status(201).json(await sessions.registerAccount(body.id, body.label));
   });
 
+  app.patch("/api/accounts/:accountId", async (request, response) => {
+    const body = request.body as AccountBody;
+    if (typeof body.label !== "string" || Object.keys(body).some((key) => key !== "label")) {
+      response.status(400).json({ error: "label must be the only field and must be a string" });
+      return;
+    }
+    response.json(await store.updateAccountLabel(request.params.accountId ?? "", body.label));
+  });
+
   app.delete("/api/accounts/:accountId", async (request, response) => {
     const removed = await sessions.removeAccount(request.params.accountId ?? "");
     response.json({ removed: removed.id, persistentProfileDeleted: false });
@@ -247,6 +261,15 @@ export function createPanelApp(services: Services = createServices()): express.E
 
   app.post("/api/accounts/:accountId/facebook-status", async (request, response) => {
     response.json(await facebook.inspectSession(request.params.accountId ?? ""));
+  });
+
+  app.post("/api/accounts/:accountId/recover", async (request, response) => {
+    const accountId = request.params.accountId ?? "";
+    const inspection = await facebook.inspectSession(accountId);
+    if (inspection.state !== "authenticated") {
+      throw new Error(`Account recovery requires authenticated inspection: ${accountId}`);
+    }
+    response.json({ account: await store.recoverAccount(accountId), inspection });
   });
 
   app.post("/api/accounts/:accountId/session/open", async (request, response) => {
@@ -322,6 +345,15 @@ export function createPanelApp(services: Services = createServices()): express.E
       return;
     }
     response.json(store.setGroupEnabled(request.params.groupId ?? "", body.enabled));
+  });
+
+  app.patch("/api/groups/:groupId/account", (request, response) => {
+    const body = request.body as GroupAccountBody;
+    if (typeof body.accountId !== "string") {
+      response.status(400).json({ error: "accountId must be a string" });
+      return;
+    }
+    response.json(store.moveGroup(request.params.groupId ?? "", body.accountId));
   });
 
   app.delete("/api/groups/:groupId", (request, response) => {
@@ -441,7 +473,12 @@ export function createPanelApp(services: Services = createServices()): express.E
               message.startsWith("Camofox profile already exists:") ||
               message.startsWith("Group URL already exists:") ||
               message.startsWith("Account has monitored groups:") ||
+              message.startsWith("Account removal already in progress:") ||
+              message.startsWith("Account removal in progress:") ||
+              message.startsWith("Account removal lease lost:") ||
               message.startsWith("Account is disabled:") ||
+              message.startsWith("Account requires authenticated recovery:") ||
+              message.startsWith("Account recovery requires authenticated inspection:") ||
               message.startsWith("Group is disabled:") ||
               message.startsWith("Response template name already exists:")
             ? 409

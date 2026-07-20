@@ -95,15 +95,23 @@
           <div id="scans-empty" class="empty card">Brak wykonanych skanów.</div>
         </div>
       </section>
+      <section class="workspace">
+        <div class="section-heading"><div><p class="eyebrow">AUDYT</p><h2>Ostatnie zdarzenia operacyjne</h2></div></div>
+        <div id="audit" class="feed"></div>
+        <div id="audit-empty" class="empty card">Brak zdarzeń audytowych.</div>
+      </section>
     </main>
 
     <template id="account-template">
       <article class="account-card card">
         <div class="account-main"><div class="avatar"></div><div><h3 class="account-label"></h3><p class="account-meta"></p></div></div>
         <div class="session-state"><span class="dot"></span><span class="state-label"></span></div>
+        <div class="account-diagnostics"></div>
         <div class="account-actions">
           <button data-action="open" type="button">Otwórz sesję</button>
           <button data-action="inspect" class="secondary" type="button">Sprawdź login</button>
+          <button data-action="recover" class="secondary" type="button">Sprawdź i odzyskaj</button>
+          <button data-action="rename" class="secondary" type="button">Zmień nazwę</button>
           <button data-action="login" class="secondary" type="button">Logowanie noVNC</button>
           <button data-action="finish" class="secondary" type="button">Zakończ logowanie</button>
           <button data-action="toggle" class="secondary" type="button">Wyłącz konto</button>

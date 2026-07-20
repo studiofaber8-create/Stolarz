@@ -17,6 +17,8 @@ const elements = {
   decisionsEmpty: document.querySelector("#decisions-empty"),
   scans: document.querySelector("#scans"),
   scansEmpty: document.querySelector("#scans-empty"),
+  audit: document.querySelector("#audit"),
+  auditEmpty: document.querySelector("#audit-empty"),
   notice: document.querySelector("#notice"),
   accountForm: document.querySelector("#account-form"),
   groupForm: document.querySelector("#group-form"),
@@ -77,14 +79,31 @@ function renderAccounts(accounts) {
     fragment.querySelector(".account-label").textContent = entry.account.label;
     fragment.querySelector(".account-meta").textContent = `${entry.account.id} · ${entry.account.camofoxUserId}`;
     const state = fragment.querySelector(".session-state");
-    state.classList.add(entry.running ? "online" : entry.error ? "offline" : "");
+    const authFailure = ["login_required", "checkpoint", "blocked"].includes(entry.account.authState);
+    state.classList.add(entry.running && !authFailure ? "online" : entry.error || authFailure ? "offline" : "");
     fragment.querySelector(".state-label").textContent = !entry.account.enabled
-      ? "Konto wyłączone"
+      ? `Konto wyłączone · ${entry.account.authState}`
       : entry.error
         ? "Błąd połączenia"
         : entry.running
-          ? `Aktywna · ${entry.tabs.length} kart`
-          : "Zatrzymana";
+          ? `Aktywna · ${entry.tabs.length} kart · ${entry.account.authState}`
+          : `Zatrzymana · ${entry.account.authState}`;
+    const diagnostics = fragment.querySelector(".account-diagnostics");
+    diagnostics.append(
+      node("p", "muted", `Ostatnia kontrola: ${formatDate(entry.account.lastInspectedAt)}`),
+    );
+    if (entry.account.recoveryRequired) {
+      diagnostics.append(node("p", "error-text", "Wymagane jawne odzyskanie po poprawnym logowaniu."));
+    }
+    if (entry.account.disabledReason) {
+      diagnostics.append(node("p", "error-text", `Powód wyłączenia: ${entry.account.disabledReason}`));
+    }
+    if (entry.account.lastAuthError && entry.account.lastAuthError !== entry.account.disabledReason) {
+      diagnostics.append(node("p", "error-text", `Ostatni błąd logowania: ${entry.account.lastAuthError}`));
+    }
+    if (entry.account.recoveredAt) {
+      diagnostics.append(node("p", "muted", `Odzyskano: ${formatDate(entry.account.recoveredAt)}`));
+    }
     fragment.querySelector('[data-action="toggle"]').textContent = entry.account.enabled
       ? "Wyłącz konto"
       : "Włącz konto";
@@ -96,7 +115,7 @@ function renderAccounts(accounts) {
   elements.groupForm.querySelector("button").disabled = accounts.length === 0;
 }
 
-function renderGroups(groups) {
+function renderGroups(groups, accounts) {
   elements.groups.replaceChildren();
   elements.groupsEmpty.classList.toggle("hidden", groups.length > 0);
   elements.groupCount.textContent = String(groups.filter((group) => group.enabled).length);
@@ -120,9 +139,21 @@ function renderGroups(groups) {
       actionButton("toggle", group.enabled ? "Wyłącz" : "Włącz", "secondary"),
       actionButton("remove", "Usuń", "danger ghost"),
     );
+    const transfer = node("div", "group-transfer");
+    const target = document.createElement("select");
+    target.dataset.role = "account-target";
+    target.setAttribute("aria-label", "Konto docelowe dla grupy");
+    for (const entry of accounts) {
+      const option = document.createElement("option");
+      option.value = entry.account.id;
+      option.textContent = `${entry.account.label}${entry.account.enabled ? "" : " (wyłączone)"}`;
+      option.selected = entry.account.id === group.accountId;
+      target.append(option);
+    }
+    transfer.append(target, actionButton("move", "Przenieś grupę", "secondary"));
     card.append(heading, url, details);
     if (error) card.append(error);
-    card.append(actions);
+    card.append(transfer, actions);
     elements.groups.append(card);
   }
 }
@@ -207,6 +238,20 @@ function renderScans(scans, groups) {
   }
 }
 
+function renderAudit(events) {
+  elements.audit.replaceChildren();
+  elements.auditEmpty.classList.toggle("hidden", events.length > 0);
+  for (const event of events.slice(0, 50)) {
+    const card = node("article", "feed-card compact card");
+    card.append(
+      node("div", "scan-line", `${event.type} · ${event.entityType} · ${event.entityId}`),
+      node("p", "muted", formatDate(event.createdAt)),
+    );
+    if (event.detail) card.append(node("p", "muted", event.detail));
+    elements.audit.append(card);
+  }
+}
+
 function node(tag, className = "", text) {
   const element = document.createElement(tag);
   if (className) element.className = className;
@@ -237,7 +282,7 @@ async function refresh() {
     const overview = await api("/api/overview");
     setHealth(overview.health);
     renderAccounts(overview.accounts);
-    renderGroups(overview.groups);
+    renderGroups(overview.groups, overview.accounts);
     renderTemplates(overview.responseTemplates);
     renderDecisions(
       overview.recentDecisions,
@@ -246,6 +291,7 @@ async function refresh() {
       overview.responseDrafts,
     );
     renderScans(overview.recentScans, overview.groups);
+    renderAudit(overview.recentAudit);
     elements.queuedCount.textContent = String(overview.monitoring.queuedJobs);
     elements.agentStatus.textContent = `${overview.worker.running ? "worker on" : "worker off"} · ${overview.llm.configured ? overview.llm.model : "LLM off"}`;
     elements.testLlm.disabled = !overview.llm.configured;
@@ -263,6 +309,24 @@ async function runAccountAction(accountId, action) {
     if (!window.confirm(`Usunąć wpis ${accountId}? Trwały profil Camofox pozostanie na dysku.`)) return;
     await api(`/api/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" });
     showNotice(`Usunięto wpis ${accountId}.`);
+    return;
+  }
+  if (action === "rename") {
+    const label = window.prompt("Nowa nazwa konta:");
+    if (label === null) return;
+    await api(`/api/accounts/${encodeURIComponent(accountId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ label }),
+    });
+    showNotice("Nazwa konta została zmieniona.");
+    return;
+  }
+  if (action === "recover") {
+    const result = await api(`/api/accounts/${encodeURIComponent(accountId)}/recover`, {
+      method: "POST",
+      body: "{}",
+    });
+    showNotice(`Konto odzyskane. Stan Facebook: ${result.inspection.state}.`);
     return;
   }
   if (action === "inspect") {
@@ -338,6 +402,13 @@ elements.groups.addEventListener("click", async (event) => {
         method: "PATCH",
         body: JSON.stringify({ enabled: !isEnabled }),
       });
+    } else if (button.dataset.action === "move") {
+      const accountId = card.querySelector('[data-role="account-target"]').value;
+      await api(`/api/groups/${encodeURIComponent(groupId)}/account`, {
+        method: "PATCH",
+        body: JSON.stringify({ accountId }),
+      });
+      showNotice("Grupa została przypisana do wybranego konta; aktywne joby zostały bezpiecznie zakończone.");
     } else if (button.dataset.action === "remove") {
       if (!window.confirm("Usunąć grupę wraz z historią postów i skanów?")) return;
       await api(`/api/groups/${encodeURIComponent(groupId)}`, { method: "DELETE" });

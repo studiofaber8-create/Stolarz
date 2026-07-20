@@ -236,9 +236,13 @@ export class AgentWorker {
         return;
       }
       this.store.assertJobLease(job.id, leaseToken);
-      const suspension =
+      const accountAuthState =
         error instanceof FacebookSessionStateError &&
-        ["login_required", "checkpoint", "blocked"].includes(error.state)
+        (error.state === "login_required" || error.state === "checkpoint" || error.state === "blocked")
+          ? error.state
+          : undefined;
+      const suspension =
+        accountAuthState !== undefined
           ? "account"
           : error instanceof FacebookSessionStateError && error.state === "access_denied"
             ? "group"
@@ -251,6 +255,7 @@ export class AgentWorker {
         message,
         retryTime(job.attempts),
         suspension,
+        accountAuthState,
       );
       const auditEvent =
         suspension === "account"

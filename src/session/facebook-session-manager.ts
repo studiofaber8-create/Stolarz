@@ -1,7 +1,12 @@
 import { CamofoxClient, CamofoxRequestError } from "../camofox/client.js";
 import type { CamofoxHealth, CamofoxTab, DisplayResult } from "../camofox/types.js";
 import type { AppConfig } from "../config.js";
-import { assertAccountId, type AccountRepository, type FacebookAccount } from "../domain/account.js";
+import {
+  assertAccountId,
+  type AccountRepository,
+  type FacebookAccount,
+  type FacebookAccountAuthState,
+} from "../domain/account.js";
 import { KeyedMutex } from "./keyed-mutex.js";
 
 export interface AccountSessionStatus {
@@ -60,9 +65,26 @@ export class FacebookSessionManager {
   public async removeAccount(accountId: string): Promise<FacebookAccount> {
     const account = await this.registry.get(accountId);
     return this.mutex.runExclusive(account.id, async () => {
-      await this.closeSessionIfPresent(account.camofoxUserId);
-      return this.registry.remove(account.id);
+      const removal = await this.registry.beginRemoval(
+        account.id,
+        Math.min(3_600_000, Math.max(60_000, this.config.requestTimeoutMs * 4)),
+      );
+      try {
+        await this.closeSessionIfPresent(removal.account.camofoxUserId);
+        return await this.registry.remove(removal.account.id, removal.token);
+      } catch (error) {
+        await this.registry.cancelRemoval(removal.account.id, removal.token);
+        throw error;
+      }
     });
+  }
+
+  public recordAccountInspection(
+    accountId: string,
+    state: FacebookAccountAuthState,
+    reason: string,
+  ): Promise<FacebookAccount> {
+    return this.registry.recordInspection(accountId, state, reason);
   }
 
   public async openSession(accountId: string, url = this.config.facebookHomeUrl): Promise<CamofoxTab> {
@@ -75,6 +97,23 @@ export class FacebookSessionManager {
     operation: (context: AccountTabContext) => Promise<T>,
   ): Promise<T> {
     const account = await this.enabledAccount(accountId);
+    return this.runWithResolvedAccountTab(account, url, operation);
+  }
+
+  public async runWithRegisteredAccountTab<T>(
+    accountId: string,
+    url: string,
+    operation: (context: AccountTabContext) => Promise<T>,
+  ): Promise<T> {
+    const account = await this.registry.get(accountId);
+    return this.runWithResolvedAccountTab(account, url, operation);
+  }
+
+  private async runWithResolvedAccountTab<T>(
+    account: FacebookAccount,
+    url: string,
+    operation: (context: AccountTabContext) => Promise<T>,
+  ): Promise<T> {
     const safeUrl = facebookUrl(url);
     return this.mutex.runExclusive(account.id, async () => {
       await this.assertHealthy();
@@ -84,7 +123,7 @@ export class FacebookSessionManager {
   }
 
   public async startManualLogin(accountId: string): Promise<LoginSessionResult> {
-    const account = await this.enabledAccount(accountId);
+    const account = await this.registry.get(accountId);
     return this.mutex.runExclusive(account.id, async () => {
       await this.assertHealthy();
       const existing = await this.camofox.listTabs(account.camofoxUserId);
@@ -108,8 +147,9 @@ export class FacebookSessionManager {
   }
 
   public async finishManualLogin(accountId: string): Promise<LoginSessionResult> {
-    const account = await this.enabledAccount(accountId);
+    const account = await this.registry.get(accountId);
     return this.mutex.runExclusive(account.id, async () => {
+      await this.assertHealthy();
       const display = await this.camofox.toggleDisplay(account.camofoxUserId, true);
       const tab = await this.camofox.createTab({
         userId: account.camofoxUserId,

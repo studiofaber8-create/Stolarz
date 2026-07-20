@@ -1,14 +1,9 @@
 import { CamofoxClient } from "../camofox/client.js";
+import type { FacebookAccountAuthState } from "../domain/account.js";
 import type { DiscoveredPostInput, MonitoredGroup } from "../domain/monitoring.js";
 import { FacebookSessionManager } from "../session/facebook-session-manager.js";
 
-export type FacebookAuthState =
-  | "authenticated"
-  | "login_required"
-  | "checkpoint"
-  | "blocked"
-  | "access_denied"
-  | "unknown";
+export type FacebookAuthState = FacebookAccountAuthState | "access_denied";
 
 export interface FacebookSessionInspection {
   readonly state: FacebookAuthState;
@@ -48,7 +43,7 @@ export class FacebookAdapter {
   ) {}
 
   public async inspectSession(accountId: string): Promise<FacebookSessionInspection> {
-    return this.sessions.runWithAccountTab(
+    const inspection = await this.sessions.runWithRegisteredAccountTab(
       accountId,
       "https://www.facebook.com/",
       async ({ account, tab }) => {
@@ -65,6 +60,12 @@ export class FacebookAdapter {
         return inspectFacebookState(navigation.url ?? "https://www.facebook.com/", snapshot.text);
       },
     );
+    await this.sessions.recordAccountInspection(
+      accountId,
+      inspection.state === "access_denied" ? "unknown" : inspection.state,
+      inspection.reason,
+    );
+    return inspection;
   }
 
   public async scanGroup(group: MonitoredGroup): Promise<FacebookGroupScanResult> {
@@ -85,6 +86,13 @@ export class FacebookAdapter {
         const snapshot = await this.camofox.snapshot(account.camofoxUserId, tab.id);
         const inspection = inspectFacebookState(currentUrl, snapshot.text);
         if (inspection.state !== "authenticated" && inspection.state !== "unknown") {
+          if (inspection.state !== "access_denied") {
+            await this.sessions.recordAccountInspection(
+              account.id,
+              inspection.state,
+              inspection.reason,
+            );
+          }
           throw new FacebookSessionStateError(inspection.state, inspection.reason);
         }
 
@@ -104,18 +112,21 @@ export class FacebookAdapter {
         );
         const posts = normalizeExtractedPosts(evaluation.value, group.maxPostsPerScan);
         if (inspection.state === "unknown" && posts.length === 0) {
+          await this.sessions.recordAccountInspection(account.id, "unknown", inspection.reason);
           throw new FacebookSessionStateError(
             "unknown",
             "Nie udało się potwierdzić zalogowania ani odczytać postów z grupy",
           );
         }
+        const authState = posts.length > 0 ? "authenticated" : inspection.state;
+        await this.sessions.recordAccountInspection(account.id, authState, inspection.reason);
         const pageErrors = await this.camofox
           .pageErrors(account.camofoxUserId, tab.id, 20)
           .then((errors) => errors.map(({ message }) => message.slice(0, 500)))
           .catch(() => []);
         return {
           currentUrl,
-          authState: posts.length > 0 ? "authenticated" : inspection.state,
+          authState,
           posts,
           pageErrors,
         };

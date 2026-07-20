@@ -8,6 +8,7 @@ import {
   assertLabel,
   type AccountRepository,
   type FacebookAccount,
+  type FacebookAccountAuthState,
 } from "../domain/account.js";
 import type {
   AgentJob,
@@ -89,7 +90,7 @@ export class MonitoringStore implements AccountRepository {
     return this.get(id);
   }
 
-  public async remove(accountId: string): Promise<FacebookAccount> {
+  public async assertRemovable(accountId: string): Promise<FacebookAccount> {
     const account = await this.get(accountId);
     const group = this.database.prepare(
       "SELECT id FROM monitored_groups WHERE account_id = ? LIMIT 1",
@@ -97,19 +98,144 @@ export class MonitoringStore implements AccountRepository {
     if (group !== undefined) {
       throw new Error(`Account has monitored groups: ${account.id}`);
     }
-    this.database.prepare("DELETE FROM accounts WHERE id = ?").run(account.id);
+    return account;
+  }
+
+  public async beginRemoval(
+    accountId: string,
+    leaseMs: number,
+  ): Promise<{ account: FacebookAccount; token: string }> {
+    const id = assertAccountId(accountId);
+    boundedInteger("removal leaseMs", leaseMs, 1_000, 3_600_000);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const token = randomUUID();
+    const account = this.transaction(() => {
+      const row = this.database.prepare("SELECT * FROM accounts WHERE id = ?").get(id);
+      if (row === undefined) throw new Error(`Unknown account: ${id}`);
+      const current = accountFromRow(row);
+      const group = this.database.prepare(
+        "SELECT id FROM monitored_groups WHERE account_id = ? LIMIT 1",
+      ).get(id);
+      if (group !== undefined) throw new Error(`Account has monitored groups: ${id}`);
+      const activeRemoval = this.database.prepare(`
+        SELECT id FROM accounts
+        WHERE id = ? AND removal_token IS NOT NULL AND removal_until >= ?
+      `).get(id, nowIso);
+      if (activeRemoval !== undefined) throw new Error(`Account removal already in progress: ${id}`);
+      this.database.prepare(`
+        UPDATE accounts SET removal_token = ?, removal_until = ?, updated_at = ? WHERE id = ?
+      `).run(token, new Date(now.getTime() + leaseMs).toISOString(), nowIso, id);
+      return current;
+    });
+    return { account, token };
+  }
+
+  public async cancelRemoval(accountId: string, token: string): Promise<void> {
+    const id = assertAccountId(accountId);
+    this.database.prepare(`
+      UPDATE accounts SET removal_token = NULL, removal_until = NULL, updated_at = ?
+      WHERE id = ? AND removal_token = ?
+    `).run(new Date().toISOString(), id, token);
+  }
+
+  public async remove(accountId: string, token: string): Promise<FacebookAccount> {
+    const id = assertAccountId(accountId);
+    const account = this.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT * FROM accounts
+        WHERE id = ? AND removal_token = ? AND removal_until >= ?
+      `).get(id, token, new Date().toISOString());
+      if (row === undefined) throw new Error(`Account removal lease lost: ${id}`);
+      const current = accountFromRow(row);
+      const group = this.database.prepare(
+        "SELECT id FROM monitored_groups WHERE account_id = ? LIMIT 1",
+      ).get(id);
+      if (group !== undefined) throw new Error(`Account has monitored groups: ${id}`);
+      this.database.prepare("DELETE FROM accounts WHERE id = ? AND removal_token = ?").run(id, token);
+      return current;
+    });
     this.recordAudit("account.deleted", "account", account.id, account.camofoxUserId);
     return account;
   }
 
-  public async setAccountEnabled(accountId: string, enabled: boolean): Promise<FacebookAccount> {
+  public async updateAccountLabel(accountId: string, label: string): Promise<FacebookAccount> {
+    const id = assertAccountId(accountId);
+    const normalizedLabel = assertLabel(label);
+    const result = this.database.prepare(
+      "UPDATE accounts SET label = ?, updated_at = ? WHERE id = ?",
+    ).run(normalizedLabel, new Date().toISOString(), id);
+    if (result.changes === 0) throw new Error(`Unknown account: ${id}`);
+    this.recordAudit("account.renamed", "account", id, normalizedLabel);
+    return this.get(id);
+  }
+
+  public async recordInspection(
+    accountId: string,
+    state: FacebookAccountAuthState,
+    reason: string,
+  ): Promise<FacebookAccount> {
+    const id = assertAccountId(accountId);
+    const inspectedAt = new Date().toISOString();
+    const detail = boundedText("inspection reason", reason, 1, 2_000);
+    const authError = state === "authenticated" ? null : detail;
+    const result = this.database.prepare(`
+      UPDATE accounts
+      SET auth_state = ?, last_inspected_at = ?, last_auth_error = ?, updated_at = ?
+      WHERE id = ?
+    `).run(state, inspectedAt, authError, inspectedAt, id);
+    if (result.changes === 0) throw new Error(`Unknown account: ${id}`);
+    this.recordAudit("account.inspected", "account", id, `${state}: ${detail}`);
+    return this.get(id);
+  }
+
+  public async recoverAccount(accountId: string): Promise<FacebookAccount> {
     const id = assertAccountId(accountId);
     const now = new Date().toISOString();
     this.transaction(() => {
-      const result = this.database.prepare(
-        "UPDATE accounts SET enabled = ?, updated_at = ? WHERE id = ?",
-      ).run(enabled ? 1 : 0, now, id);
-      if (result.changes === 0) throw new Error(`Unknown account: ${id}`);
+      const current = this.database.prepare(
+        "SELECT auth_state FROM accounts WHERE id = ?",
+      ).get(id);
+      if (current === undefined) throw new Error(`Unknown account: ${id}`);
+      if (requiredString(current.auth_state) !== "authenticated") {
+        throw new Error(`Account recovery requires authenticated inspection: ${id}`);
+      }
+      this.database.prepare(`
+        UPDATE accounts
+        SET enabled = 1, recovery_required = 0, disabled_reason = NULL,
+            last_auth_error = NULL, recovered_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(now, now, id);
+    });
+    this.recordAudit("account.recovered", "account", id);
+    return this.get(id);
+  }
+
+  public async setAccountEnabled(
+    accountId: string,
+    enabled: boolean,
+    reason = "Disabled by operator",
+  ): Promise<FacebookAccount> {
+    const id = assertAccountId(accountId);
+    const now = new Date().toISOString();
+    const disabledReason = enabled ? undefined : boundedText("disabled reason", reason, 1, 2_000);
+    this.transaction(() => {
+      const current = this.database.prepare(
+        "SELECT auth_state, recovery_required FROM accounts WHERE id = ?",
+      ).get(id);
+      if (current === undefined) throw new Error(`Unknown account: ${id}`);
+      const authState = requiredString(current.auth_state) as FacebookAccountAuthState;
+      if (enabled && numeric(current.recovery_required) === 1) {
+        throw new Error(`Account requires authenticated recovery: ${id}`);
+      }
+      if (enabled && ["login_required", "checkpoint", "blocked"].includes(authState)) {
+        throw new Error(`Account requires authenticated recovery: ${id}`);
+      }
+      this.database.prepare(`
+        UPDATE accounts
+        SET enabled = ?, disabled_reason = ?, updated_at = ?
+        WHERE id = ?
+      `).run(enabled ? 1 : 0, disabledReason ?? null, now, id);
       if (!enabled) {
         this.database.prepare(`
           UPDATE scan_runs
@@ -130,15 +256,17 @@ export class MonitoringStore implements AccountRepository {
         `).run(now, id);
       }
     });
-    this.recordAudit(enabled ? "account.enabled" : "account.disabled", "account", id);
+    this.recordAudit(
+      enabled ? "account.enabled" : "account.disabled",
+      "account",
+      id,
+      disabledReason,
+    );
     return this.get(id);
   }
 
   public createGroup(input: CreateGroupInput): MonitoredGroup {
     const accountId = normalizedIdentifier("accountId", input.accountId);
-    if (this.database.prepare("SELECT id FROM accounts WHERE id = ?").get(accountId) === undefined) {
-      throw new Error(`Unknown account: ${accountId}`);
-    }
     const name = boundedText("name", input.name, 1, 120);
     const url = facebookGroupUrl(input.url);
     const scanIntervalSeconds = boundedInteger(
@@ -152,24 +280,35 @@ export class MonitoringStore implements AccountRepository {
     const now = new Date().toISOString();
     const id = randomUUID();
     try {
-      this.database.prepare(`
-        INSERT INTO monitored_groups (
-          id, account_id, name, url, enabled, scan_interval_seconds,
-          max_posts_per_scan, prompt_context, next_scan_at, last_status,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, 'never', ?, ?)
-      `).run(
-        id,
-        accountId,
-        name,
-        url,
-        scanIntervalSeconds,
-        maxPostsPerScan,
-        promptContext,
-        now,
-        now,
-        now,
-      );
+      this.transaction(() => {
+        const account = this.database.prepare(`
+          SELECT id FROM accounts
+          WHERE id = ? AND (removal_until IS NULL OR removal_until < ?)
+        `).get(accountId, now);
+        if (account === undefined) {
+          const exists = this.database.prepare("SELECT id FROM accounts WHERE id = ?").get(accountId);
+          if (exists === undefined) throw new Error(`Unknown account: ${accountId}`);
+          throw new Error(`Account removal in progress: ${accountId}`);
+        }
+        this.database.prepare(`
+          INSERT INTO monitored_groups (
+            id, account_id, name, url, enabled, scan_interval_seconds,
+            max_posts_per_scan, prompt_context, next_scan_at, last_status,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, 'never', ?, ?)
+        `).run(
+          id,
+          accountId,
+          name,
+          url,
+          scanIntervalSeconds,
+          maxPostsPerScan,
+          promptContext,
+          now,
+          now,
+          now,
+        );
+      });
     } catch (error) {
       if (isUniqueConstraint(error)) throw new Error(`Group URL already exists: ${url}`);
       throw error;
@@ -218,6 +357,53 @@ export class MonitoringStore implements AccountRepository {
       }
     });
     this.recordAudit(enabled ? "group.enabled" : "group.disabled", "group", groupId);
+    return this.getGroup(groupId);
+  }
+
+  public moveGroup(groupId: string, targetAccountId: string): MonitoredGroup {
+    const accountId = assertAccountId(targetAccountId);
+    const now = new Date().toISOString();
+    const previousAccountId = this.transaction(() => {
+      const group = this.database.prepare(
+        "SELECT account_id FROM monitored_groups WHERE id = ?",
+      ).get(groupId);
+      if (group === undefined) throw new Error(`Unknown group: ${groupId}`);
+      const previous = requiredString(group.account_id);
+      const target = this.database.prepare(`
+        SELECT id FROM accounts
+        WHERE id = ? AND (removal_until IS NULL OR removal_until < ?)
+      `).get(accountId, now);
+      if (target === undefined) {
+        const exists = this.database.prepare("SELECT id FROM accounts WHERE id = ?").get(accountId);
+        if (exists === undefined) throw new Error(`Unknown account: ${accountId}`);
+        throw new Error(`Account removal in progress: ${accountId}`);
+      }
+      if (previous === accountId) return previous;
+      const transferError = `Group moved from account ${previous} to ${accountId}`;
+      this.database.prepare(`
+        UPDATE scan_runs
+        SET status = 'failed', completed_at = ?, error = ?
+        WHERE status = 'running' AND job_id IN (
+          SELECT id FROM jobs WHERE group_id = ?
+        )
+      `).run(now, transferError, groupId);
+      this.database.prepare(`
+        UPDATE jobs
+        SET status = 'dead', lease_owner = NULL, lease_until = NULL, lease_token = NULL,
+            last_error = ?, updated_at = ?
+        WHERE group_id = ? AND status IN ('queued', 'running')
+      `).run(transferError, now, groupId);
+      this.database.prepare(`
+        UPDATE monitored_groups
+        SET account_id = ?, next_scan_at = ?, last_status = 'never',
+            last_error = NULL, last_scanned_at = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(accountId, now, now, groupId);
+      return previous;
+    });
+    if (previousAccountId !== accountId) {
+      this.recordAudit("group.moved", "group", groupId, `${previousAccountId}->${accountId}`);
+    }
     return this.getGroup(groupId);
   }
 
@@ -314,7 +500,10 @@ export class MonitoringStore implements AccountRepository {
           AND monitored_groups.enabled = 1 AND accounts.enabled = 1
           AND NOT EXISTS (
             SELECT 1 FROM jobs AS running_job
-            WHERE running_job.group_id = jobs.group_id AND running_job.status = 'running'
+            INNER JOIN monitored_groups AS running_group
+              ON running_group.id = running_job.group_id
+            WHERE running_job.status = 'running'
+              AND running_group.account_id = monitored_groups.account_id
           )
         ORDER BY jobs.available_at ASC, jobs.created_at ASC
         LIMIT 1
@@ -377,7 +566,7 @@ export class MonitoringStore implements AccountRepository {
     const now = new Date().toISOString();
     return this.transaction(() => {
       const owned = this.database.prepare(`
-        SELECT scan_runs.group_id FROM scan_runs
+        SELECT scan_runs.group_id, monitored_groups.account_id FROM scan_runs
         INNER JOIN jobs ON jobs.id = scan_runs.job_id
         INNER JOIN monitored_groups ON monitored_groups.id = jobs.group_id
         INNER JOIN accounts ON accounts.id = monitored_groups.account_id
@@ -397,6 +586,12 @@ export class MonitoringStore implements AccountRepository {
         SET last_status = 'succeeded', last_error = NULL, last_scanned_at = ?, updated_at = ?
         WHERE id = ?
       `).run(now, now, requiredString(owned.group_id));
+      this.database.prepare(`
+        UPDATE accounts
+        SET auth_state = 'authenticated', last_inspected_at = ?, last_auth_error = NULL,
+            updated_at = ?
+        WHERE id = ?
+      `).run(now, now, requiredString(owned.account_id));
       const completed = this.database.prepare(`
         UPDATE jobs SET status = 'succeeded', lease_owner = NULL, lease_until = NULL,
           lease_token = NULL, last_error = NULL, updated_at = ?
@@ -415,6 +610,7 @@ export class MonitoringStore implements AccountRepository {
     error: string,
     retryAt: string,
     suspension: "account" | "group" | undefined,
+    accountAuthState?: Extract<FacebookAccountAuthState, "login_required" | "checkpoint" | "blocked">,
   ): void {
     const now = new Date().toISOString();
     const terminal = suspension !== undefined;
@@ -478,9 +674,13 @@ export class MonitoringStore implements AccountRepository {
             SELECT id FROM monitored_groups WHERE account_id = ?
           )
         `).run(error.slice(0, 2_000), now, jobId, accountId);
-        this.database.prepare(
-          "UPDATE accounts SET enabled = 0, updated_at = ? WHERE id = ?",
-        ).run(now, accountId);
+        this.database.prepare(`
+          UPDATE accounts
+          SET enabled = 0, auth_state = ?, recovery_required = 1,
+              last_inspected_at = ?, last_auth_error = ?,
+              disabled_reason = ?, updated_at = ?
+          WHERE id = ?
+        `).run(accountAuthState ?? "unknown", now, error.slice(0, 2_000), error.slice(0, 2_000), now, accountId);
       } else if (suspension === "group") {
         this.database.prepare(`
           UPDATE scan_runs
@@ -1097,14 +1297,17 @@ export class MonitoringStore implements AccountRepository {
         }
         this.database.prepare(`
           INSERT INTO accounts (
-            id, label, camofox_user_id, session_key, enabled, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, label, camofox_user_id, session_key, enabled, recovery_required,
+            disabled_reason, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           account.id,
           account.label,
           account.camofoxUserId,
           account.sessionKey,
           account.enabled ? 1 : 0,
+          account.enabled ? 0 : 1,
+          account.enabled ? null : "Legacy disabled account requires verification",
           account.createdAt,
           account.updatedAt,
         );
@@ -1114,13 +1317,23 @@ export class MonitoringStore implements AccountRepository {
   }
 
   private migrate(): void {
-    this.database.exec(`
+    this.transaction(() => {
+      this.database.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL,
         camofox_user_id TEXT NOT NULL UNIQUE,
         session_key TEXT NOT NULL,
         enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        auth_state TEXT NOT NULL DEFAULT 'unknown'
+          CHECK(auth_state IN ('unknown','authenticated','login_required','checkpoint','blocked')),
+        recovery_required INTEGER NOT NULL DEFAULT 0 CHECK(recovery_required IN (0, 1)),
+        last_inspected_at TEXT,
+        last_auth_error TEXT,
+        disabled_reason TEXT,
+        recovered_at TEXT,
+        removal_token TEXT,
+        removal_until TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -1242,22 +1455,54 @@ export class MonitoringStore implements AccountRepository {
       CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_events(created_at DESC);
     `);
     this.ensureColumn("jobs", "lease_token", "TEXT");
+    this.ensureColumn("accounts", "auth_state", "TEXT NOT NULL DEFAULT 'unknown'");
+    const recoveryRequiredAdded = this.ensureColumn(
+      "accounts",
+      "recovery_required",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    this.ensureColumn("accounts", "last_inspected_at", "TEXT");
+    this.ensureColumn("accounts", "last_auth_error", "TEXT");
+    this.ensureColumn("accounts", "disabled_reason", "TEXT");
+    this.ensureColumn("accounts", "recovered_at", "TEXT");
+    this.ensureColumn("accounts", "removal_token", "TEXT");
+    this.ensureColumn("accounts", "removal_until", "TEXT");
+      if (recoveryRequiredAdded) {
+        this.database.prepare(`
+          UPDATE accounts
+          SET recovery_required = 1,
+              disabled_reason = COALESCE(disabled_reason, 'Migrated disabled account requires verification')
+          WHERE enabled = 0
+        `).run();
+      }
+    });
   }
 
-  private ensureColumn(table: string, column: string, definition: string): void {
+  private ensureColumn(table: string, column: string, definition: string): boolean {
     const columns = this.database.prepare(`PRAGMA table_info(${table})`).all();
-    if (columns.some((row) => row.name === column)) return;
+    if (columns.some((row) => row.name === column)) return false;
     this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 }
 
 function accountFromRow(row: Record<string, SQLOutputValue>): FacebookAccount {
+  const lastInspectedAt = nullableString(row.last_inspected_at);
+  const lastAuthError = nullableString(row.last_auth_error);
+  const disabledReason = nullableString(row.disabled_reason);
+  const recoveredAt = nullableString(row.recovered_at);
   return {
     id: requiredString(row.id),
     label: requiredString(row.label),
     camofoxUserId: requiredString(row.camofox_user_id),
     sessionKey: requiredString(row.session_key),
     enabled: numeric(row.enabled) === 1,
+    authState: requiredString(row.auth_state) as FacebookAccountAuthState,
+    recoveryRequired: numeric(row.recovery_required) === 1,
+    ...(lastInspectedAt === undefined ? {} : { lastInspectedAt }),
+    ...(lastAuthError === undefined ? {} : { lastAuthError }),
+    ...(disabledReason === undefined ? {} : { disabledReason }),
+    ...(recoveredAt === undefined ? {} : { recoveredAt }),
     createdAt: requiredString(row.created_at),
     updatedAt: requiredString(row.updated_at),
   };
@@ -1554,6 +1799,8 @@ function parseLegacyAccounts(raw: string): FacebookAccount[] {
       camofoxUserId: accountToken("camofoxUserId", account.camofoxUserId, 97),
       sessionKey: accountToken("sessionKey", account.sessionKey, 64),
       enabled: account.enabled,
+      authState: "unknown",
+      recoveryRequired: !account.enabled,
       createdAt: new Date(account.createdAt).toISOString(),
       updatedAt: new Date(account.updatedAt).toISOString(),
     };

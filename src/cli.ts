@@ -8,6 +8,10 @@ interface AddAccountOptions {
   readonly label: string;
 }
 
+interface RenameAccountOptions {
+  readonly label: string;
+}
+
 interface OpenSessionOptions {
   readonly url?: string;
 }
@@ -103,6 +107,13 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<vo
   account.command("list").description("List registered accounts").action(async () => {
     print(await sessions.listAccounts());
   });
+  account
+    .command("rename")
+    .argument("<accountId>")
+    .requiredOption("-l, --label <label>", "New human-readable account name")
+    .action(async (accountId: string, options: RenameAccountOptions) => {
+      print(await store.updateAccountLabel(accountId, options.label));
+    });
   account.command("enable").argument("<accountId>").action(async (accountId: string) => {
     print(await store.setAccountEnabled(accountId, true));
   });
@@ -122,6 +133,17 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<vo
     .description("Inspect Facebook authentication state")
     .action(async (accountId: string) => {
       print(await facebook.inspectSession(accountId));
+    });
+  account
+    .command("recover")
+    .argument("<accountId>")
+    .description("Verify Facebook login and explicitly recover a suspended account")
+    .action(async (accountId: string) => {
+      const inspection = await facebook.inspectSession(accountId);
+      if (inspection.state !== "authenticated") {
+        throw new Error(`Account recovery requires authenticated inspection: ${accountId}`);
+      }
+      print({ account: await store.recoverAccount(accountId), inspection });
     });
   account
     .command("remove")
@@ -215,6 +237,11 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<vo
   group.command("disable").argument("<groupId>").action((groupId: string) => {
     print(store.setGroupEnabled(groupId, false));
   });
+  group.command("move").argument("<groupId>").argument("<accountId>").action(
+    (groupId: string, accountId: string) => {
+      print(store.moveGroup(groupId, accountId));
+    },
+  );
   group.command("remove").argument("<groupId>").action((groupId: string) => {
     store.deleteGroup(groupId);
     print({ removed: groupId });
@@ -249,6 +276,10 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<vo
     .action((options: ListOptions) => print(store.listScanRuns(integerOption("limit", options.limit, 1, 500))));
   monitor.command("jobs").option("--limit <number>", "Result limit", "100")
     .action((options: ListOptions) => print(store.listJobs(integerOption("limit", options.limit, 1, 500))));
+  monitor.command("audit").option("--limit <number>", "Result limit", "100")
+    .action((options: ListOptions) => print(
+      store.listAuditEvents(integerOption("limit", options.limit, 1, 500)),
+    ));
 
   const template = program.command("template").description("Manage Spintax/LLM response templates");
   template
