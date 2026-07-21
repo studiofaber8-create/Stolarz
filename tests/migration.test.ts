@@ -18,7 +18,7 @@ describe("schema migrations", () => {
 
   it("creates fresh database at latest version", () => {
     const store = new MonitoringStore(dataDir);
-    expect(store.schemaVersion()).toBe(3);
+    expect(store.schemaVersion()).toBe(4);
     store.close();
   });
 
@@ -26,11 +26,11 @@ describe("schema migrations", () => {
     const store1 = new MonitoringStore(dataDir);
     store1.close();
     const store2 = new MonitoringStore(dataDir);
-    expect(store2.schemaVersion()).toBe(3);
+    expect(store2.schemaVersion()).toBe(4);
     store2.close();
   });
 
-  it("migrates an existing v2 database with group and scan data to v3", async () => {
+  it("migrates an existing v2 database with group and scan data to the latest schema", async () => {
     const v2Store = new MonitoringStore(dataDir);
     await v2Store.add({
       id: "v2-account",
@@ -63,12 +63,14 @@ describe("schema migrations", () => {
       ALTER TABLE scan_runs DROP COLUMN snapshot_checks;
       ALTER TABLE scan_runs DROP COLUMN scroll_rounds;
       ALTER TABLE scan_runs DROP COLUMN page_error_count;
-      DELETE FROM schema_migrations WHERE version = 3;
+      DROP TABLE llm_usage_charges;
+      DROP TABLE llm_runs;
+      DELETE FROM schema_migrations WHERE version >= 3;
     `);
     db.close();
 
     const migrated = new MonitoringStore(dataDir);
-    expect(migrated.schemaVersion()).toBe(3);
+    expect(migrated.schemaVersion()).toBe(4);
     const preservedGroup = migrated.getGroup(group.id);
     expect(preservedGroup.name).toBe("Preserved V2 group");
     expect(preservedGroup.extractionHealth).toBe("unknown");
@@ -82,6 +84,42 @@ describe("schema migrations", () => {
       pageErrorCount: 0,
     });
     expect(preservedScan?.extractorVersion).toBeUndefined();
+    migrated.close();
+  });
+
+  it("migrates a populated v3 database to the durable LLM ledger", async () => {
+    const current = new MonitoringStore(dataDir);
+    await current.add({
+      id: "v3-account",
+      label: "V3 account",
+      camofoxUserId: "v3-profile",
+      sessionKey: "facebook-main",
+    });
+    const group = current.createGroup({
+      accountId: "v3-account",
+      name: "Preserved V3 group",
+      url: "https://www.facebook.com/groups/v3-fixture",
+      scanIntervalSeconds: 600,
+      maxPostsPerScan: 10,
+    });
+    current.close();
+
+    const db = new DatabaseSync(path.join(dataDir, "agent.sqlite"));
+    db.exec("DROP TABLE llm_usage_charges; DROP TABLE llm_runs; DELETE FROM schema_migrations WHERE version = 4;");
+    db.close();
+
+    const migrated = new MonitoringStore(dataDir);
+    expect(migrated.schemaVersion()).toBe(4);
+    expect(migrated.getGroup(group.id).name).toBe("Preserved V3 group");
+    expect(migrated.listLlmRuns()).toEqual([]);
+    expect(migrated.llmQueueSummary()).toMatchObject({
+      queued: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 0,
+      skippedBudget: 0,
+      tokensToday: 0,
+    });
     migrated.close();
   });
 
@@ -153,7 +191,7 @@ describe("schema migrations", () => {
     db.close();
 
     const store = new MonitoringStore(dataDir);
-    expect(store.schemaVersion()).toBe(3);
+    expect(store.schemaVersion()).toBe(4);
     store.close();
   });
 

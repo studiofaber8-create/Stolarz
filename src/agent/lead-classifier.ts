@@ -1,5 +1,7 @@
-import type { MonitoredGroup, StoredPost } from "../domain/monitoring.js";
+import { createHash } from "node:crypto";
+import type { LlmWorkDescriptor, MonitoredGroup, StoredPost } from "../domain/monitoring.js";
 import { CustomLlmClient } from "../llm/custom-llm-client.js";
+import { classificationSourceVersion } from "../llm/llm-source-version.js";
 import {
   LeadPolicyGate,
   type PolicyDecision,
@@ -10,9 +12,13 @@ export interface ClassifiedLead {
   readonly decision: PolicyDecision;
   readonly model: string;
   readonly latencyMs: number;
+  readonly requestAttempts: number;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
 }
+
+export const LEAD_CLASSIFIER_PROMPT_VERSION = "lead-classifier-v1";
+export const LEAD_CLASSIFIER_TOKEN_RESERVE = 2_500;
 
 const CATEGORIES = new Set<ValidatedClassification["category"]>([
   "custom_kitchen",
@@ -32,12 +38,39 @@ export class LeadClassifier {
     if (businessDescription.trim() === "") throw new Error("Business description cannot be empty");
   }
 
-  public async classify(group: MonitoredGroup, post: StoredPost): Promise<ClassifiedLead> {
+  public describe(group: MonitoredGroup, post: StoredPost): LlmWorkDescriptor {
+    const system = systemPrompt(this.businessDescription);
+    const prompt = classificationPrompt(group, post);
+    return {
+      operation: "classification",
+      entityId: post.id,
+      groupId: group.id,
+      model: this.llm.metadata.model,
+      promptVersion: LEAD_CLASSIFIER_PROMPT_VERSION,
+      inputHash: createHash("sha256")
+        .update(JSON.stringify({ system, prompt, maxTokens: 500, temperature: 0 }))
+        .digest("hex"),
+      sourceVersion: classificationSourceVersion(group, post),
+      reservedTokens: Math.max(
+        LEAD_CLASSIFIER_TOKEN_RESERVE,
+        Math.ceil((system.length + prompt.length) / 2) + 500,
+      ),
+    };
+  }
+
+  public async classify(
+    group: MonitoredGroup,
+    post: StoredPost,
+    idempotencyKey?: string,
+  ): Promise<ClassifiedLead> {
     const result = await this.llm.complete({
       system: systemPrompt(this.businessDescription),
       prompt: classificationPrompt(group, post),
       maxTokens: 500,
       temperature: 0,
+      ...(idempotencyKey === undefined
+        ? {}
+        : { idempotencyKey, maxAttempts: 1 }),
     });
     const classification = validateClassification(parseJsonObject(result.text));
     const decision = this.policyGate.evaluate(classification);
@@ -45,6 +78,7 @@ export class LeadClassifier {
       decision,
       model: result.model,
       latencyMs: result.latencyMs,
+      requestAttempts: result.requestAttempts,
       ...(result.usage?.inputTokens === undefined
         ? {}
         : { inputTokens: result.usage.inputTokens }),

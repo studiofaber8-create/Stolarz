@@ -1,12 +1,21 @@
 import { hostname } from "node:os";
 import type { AgentConfig } from "../config.js";
-import type { AgentJob, LeadDecision, MonitoredGroup, ScanRun } from "../domain/monitoring.js";
+import type {
+  AgentJob,
+  LeadDecision,
+  LlmErrorCategory,
+  LlmRun,
+  LlmWorkDescriptor,
+  MonitoredGroup,
+  ScanRun,
+} from "../domain/monitoring.js";
 import {
   FacebookAdapter,
   FacebookExtractionError,
   FacebookSessionStateError,
 } from "../facebook/facebook-adapter.js";
 import { MonitoringStore } from "../infra/monitoring-store.js";
+import { LlmRequestError } from "../llm/custom-llm-client.js";
 import type { Logger } from "../observability/logger.js";
 import { LeadClassifier } from "./lead-classifier.js";
 import { ResponseDraftGenerator } from "./response-draft-generator.js";
@@ -19,6 +28,7 @@ export interface WorkerStatus {
   readonly lastJobAt?: string;
   readonly lastError?: string;
   readonly jobsProcessed: number;
+  readonly llmRunsProcessed: number;
 }
 
 export class AgentWorker {
@@ -30,6 +40,8 @@ export class AgentWorker {
   private lastJobAt: string | undefined;
   private lastError: string | undefined;
   private jobsProcessed = 0;
+  private llmRunsProcessed = 0;
+  private preferLlmWork = false;
 
   public constructor(
     private readonly config: AgentConfig,
@@ -66,15 +78,13 @@ export class AgentWorker {
       ...(this.lastJobAt === undefined ? {} : { lastJobAt: this.lastJobAt }),
       ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
       jobsProcessed: this.jobsProcessed,
+      llmRunsProcessed: this.llmRunsProcessed,
     };
   }
 
   public async runOnce(scheduleDue = true): Promise<boolean> {
     if (scheduleDue) this.scheduleDueScans();
-    const job = this.store.claimNextJob(this.workerId, this.config.leaseMs);
-    if (job === undefined) return false;
-    await this.processJob(job);
-    return true;
+    return this.runNextWork();
   }
 
   private async runLoop(signal: AbortSignal): Promise<void> {
@@ -86,12 +96,9 @@ export class AgentWorker {
           this.scheduleDueScans();
           nextScheduleAt = Date.now() + this.config.schedulerIntervalMs;
         }
-        const job = this.store.claimNextJob(this.workerId, this.config.leaseMs);
-        if (job === undefined) {
+        if (!await this.runNextWork()) {
           await abortableDelay(this.config.pollIntervalMs, signal);
-          continue;
         }
-        await this.processJob(job);
         this.lastError = undefined;
       } catch (error) {
         if (signal.aborted) break;
@@ -105,11 +112,242 @@ export class AgentWorker {
     }
   }
 
+  private async runNextWork(): Promise<boolean> {
+    this.reconcileLlmWork();
+    if (this.preferLlmWork && await this.claimAndProcessLlmRun()) {
+      this.preferLlmWork = false;
+      return true;
+    }
+    const job = this.store.claimNextJob(this.workerId, this.config.leaseMs);
+    if (job !== undefined) {
+      await this.processJob(job);
+      this.preferLlmWork = true;
+      return true;
+    }
+    if (await this.claimAndProcessLlmRun()) {
+      this.preferLlmWork = false;
+      return true;
+    }
+    return false;
+  }
+
   private scheduleDueScans(): void {
     const created = this.store.enqueueDueScans();
     if (created > 0) {
       this.logger.info("scheduler.jobs_created", { count: created });
     }
+  }
+
+  private reconcileLlmWork(): void {
+    if (this.classifier === undefined) return;
+    for (const post of this.store.listPostsNeedingClassification(100)) {
+      try {
+        const group = this.store.getGroup(post.groupId);
+        this.store.enqueueLlmRun(
+          this.classifier.describe(group, post),
+          this.config.llmRunMaxAttempts,
+        );
+      } catch (error) {
+        this.logger.warn("llm.reconcile_classification_failed", {
+          postId: post.id,
+          error: errorMessage(error).slice(0, 1_000),
+        });
+      }
+    }
+    if (this.draftGenerator === undefined) return;
+    for (const decision of this.store.listDecisionsNeedingDraft(100)) {
+      try {
+        this.enqueueDraftForDecision(
+          decision,
+          this.store.findClassificationScanId(decision.postId),
+        );
+      } catch (error) {
+        this.logger.warn("llm.reconcile_draft_failed", {
+          decisionId: decision.id,
+          error: errorMessage(error).slice(0, 1_000),
+        });
+      }
+    }
+  }
+
+  private async claimAndProcessLlmRun(): Promise<boolean> {
+    if (this.classifier === undefined) return false;
+    const run = this.store.claimNextLlmRun(
+      this.workerId,
+      this.config.leaseMs,
+      this.config.llmDailyTokenBudget,
+      this.config.llmScanTokenBudget,
+    );
+    if (run === undefined) return false;
+    await this.processLlmRun(run);
+    return true;
+  }
+
+  private async processLlmRun(run: LlmRun): Promise<void> {
+    const leaseToken = requiredLlmLeaseToken(run);
+    let leaseLost = false;
+    const heartbeat = setInterval(() => {
+      try {
+        this.store.extendLlmRunLease(run.id, leaseToken, this.config.leaseMs);
+      } catch (error) {
+        leaseLost = true;
+        this.logger.error("llm.lease_lost", {
+          runId: run.id,
+          error: errorMessage(error),
+        });
+      }
+    }, Math.max(1_000, Math.floor(this.config.leaseMs / 3)));
+    heartbeat.unref();
+    this.logger.info("llm.run_started", {
+      runId: run.id,
+      operation: run.operation,
+      attempt: run.attempts,
+    });
+    try {
+      const completed = run.operation === "classification"
+        ? await this.processClassificationRun(run, leaseToken)
+        : await this.processDraftRun(run, leaseToken);
+      if (!completed) {
+        this.llmRunsProcessed += 1;
+        this.store.recordAudit("llm.superseded", "llm_run", run.id, run.operation);
+        this.logger.info("llm.run_superseded", { runId: run.id, operation: run.operation });
+        return;
+      }
+      if (leaseLost) throw new Error(`LLM run lease lost: ${run.id}`);
+      this.llmRunsProcessed += 1;
+      this.store.recordAudit("llm.succeeded", "llm_run", run.id, run.operation);
+      this.logger.info("llm.run_succeeded", { runId: run.id, operation: run.operation });
+    } catch (error) {
+      const message = errorMessage(error);
+      if (leaseLost || message.startsWith("LLM run lease lost:")) {
+        this.lastError = message;
+        this.llmRunsProcessed += 1;
+        this.logger.warn("llm.abandoned_after_lease_loss", { runId: run.id, error: message });
+        return;
+      }
+      const failure = classifyLlmFailure(error);
+      const failed = this.store.failLlmRun(
+        run.id,
+        leaseToken,
+        failure.category,
+        message,
+        failure.retryable,
+        llmRetryTime(run.attempts, failure.retryAfterMs),
+        failure.requestAttempts,
+      );
+      this.llmRunsProcessed += 1;
+      this.lastError = message;
+      this.store.recordAudit(
+        failed.status === "queued" ? "llm.retry_scheduled" : "llm.failed",
+        "llm_run",
+        run.id,
+        `${failure.category}: ${message}`.slice(0, 2_000),
+      );
+      this.logger.warn(
+        failed.status === "queued" ? "llm.run_retry_scheduled" : "llm.run_failed",
+        {
+          runId: run.id,
+          operation: run.operation,
+          attempt: failed.attempts,
+          category: failure.category,
+          error: message.slice(0, 1_000),
+        },
+      );
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
+  private async processClassificationRun(run: LlmRun, leaseToken: string): Promise<boolean> {
+    if (this.classifier === undefined) throw new Error("Lead classifier is not configured");
+    const post = this.store.getPost(run.entityId);
+    const group = this.store.getGroup(post.groupId);
+    const descriptor = this.classifier.describe(group, post);
+    if (!matchesLlmDescriptor(run, descriptor)) {
+      this.store.failLlmRun(
+        run.id,
+        leaseToken,
+        "stale_input",
+        "Classification input changed before execution",
+        false,
+        new Date().toISOString(),
+      );
+      this.store.enqueueLlmRun(descriptor, this.config.llmRunMaxAttempts);
+      return false;
+    }
+    const classified = await this.classifier.classify(group, post, run.idempotencyKey);
+    const decision = this.store.completeClassificationLlmRun(run.id, leaseToken, {
+      postId: post.id,
+      relevant: classified.decision.relevant,
+      category: classified.decision.category,
+      confidence: classified.decision.confidence,
+      reason: classified.decision.reason,
+      status: classified.decision.status,
+      model: classified.model,
+      latencyMs: classified.latencyMs,
+      requestAttempts: classified.requestAttempts,
+      ...(classified.inputTokens === undefined ? {} : { inputTokens: classified.inputTokens }),
+      ...(classified.outputTokens === undefined ? {} : { outputTokens: classified.outputTokens }),
+    });
+    try {
+      this.enqueueDraftForDecision(decision, run.scanId);
+    } catch (error) {
+      this.logger.warn("llm.enqueue_draft_failed", {
+        decisionId: decision.id,
+        error: errorMessage(error).slice(0, 1_000),
+      });
+    }
+    return true;
+  }
+
+  private async processDraftRun(run: LlmRun, leaseToken: string): Promise<boolean> {
+    if (this.draftGenerator === undefined) throw new Error("Response draft generator is not configured");
+    const decision = this.store.getDecision(run.entityId);
+    const post = this.store.getPost(decision.postId);
+    const group = this.store.getGroup(post.groupId);
+    if (decision.status !== "review" || run.templateId === undefined) {
+      throw new Error("Draft input is no longer eligible for review");
+    }
+    const template = this.store.getResponseTemplate(run.templateId);
+    const descriptor = this.draftGenerator.describe(template, group, post, decision);
+    if (!template.enabled || !matchesLlmDescriptor(run, descriptor)) {
+      this.store.failLlmRun(
+        run.id,
+        leaseToken,
+        "stale_input",
+        "Draft input or template changed before execution",
+        false,
+        new Date().toISOString(),
+      );
+      if (template.enabled) {
+        this.store.enqueueLlmRun(descriptor, this.config.llmRunMaxAttempts);
+      }
+      return false;
+    }
+    const draft = await this.draftGenerator.generate(
+      template,
+      group,
+      post,
+      decision,
+      run.idempotencyKey,
+    );
+    this.store.completeDraftLlmRun(run.id, leaseToken, draft);
+    return true;
+  }
+
+  private enqueueDraftForDecision(decision: LeadDecision, scanId?: string): void {
+    if (decision.status !== "review" || this.draftGenerator === undefined) return;
+    const template = this.store.findResponseTemplate(decision.category);
+    if (template === undefined) return;
+    const post = this.store.getPost(decision.postId);
+    const group = this.store.getGroup(post.groupId);
+    this.store.enqueueLlmRun(
+      {
+        ...this.draftGenerator.describe(template, group, post, decision),
+        ...(scanId === undefined ? {} : { scanId }),
+      },
+      this.config.llmRunMaxAttempts,
+    );
   }
 
   private async processJob(job: AgentJob): Promise<void> {
@@ -157,61 +395,13 @@ export class AgentWorker {
           discovered,
         );
         if (stored.isNew) counts.postsNew += 1;
-        const shouldClassify =
-          this.classifier !== undefined &&
-          (stored.isNew || stored.contentChanged || !this.store.hasDecision(stored.post.id));
-        let decision: LeadDecision | undefined = this.store.getDecisionByPost(stored.post.id);
-        if (shouldClassify && this.classifier !== undefined) {
-          const classified = await this.classifier.classify(group, stored.post);
-          if (leaseLost) throw new Error(`Job lease lost: ${job.id}`);
-          this.store.assertJobLease(job.id, leaseToken);
-          decision = this.store.saveDecisionForJob(job.id, leaseToken, {
-            postId: stored.post.id,
-            relevant: classified.decision.relevant,
-            category: classified.decision.category,
-            confidence: classified.decision.confidence,
-            reason: classified.decision.reason,
-            status: classified.decision.status,
-            model: classified.model,
-            latencyMs: classified.latencyMs,
-            ...(classified.inputTokens === undefined ? {} : { inputTokens: classified.inputTokens }),
-            ...(classified.outputTokens === undefined ? {} : { outputTokens: classified.outputTokens }),
-          });
-          counts.decisionsCreated += 1;
-        }
-        if (
-          decision?.status === "review" &&
-          this.draftGenerator !== undefined &&
-          this.store.getResponseDraftByDecision(decision.id) === undefined
-        ) {
-          const template = this.store.findResponseTemplate(decision.category);
-          if (template !== undefined) {
-            try {
-              const draft = await this.draftGenerator.generate(
-                template,
-                group,
-                stored.post,
-                decision,
-              );
-              if (leaseLost) throw new Error(`Job lease lost: ${job.id}`);
-              this.store.assertJobLease(job.id, leaseToken);
-              this.store.saveResponseDraftForJob(job.id, leaseToken, draft);
-            } catch (error) {
-              const draftError = errorMessage(error);
-              if (draftError.startsWith("Job lease lost:")) throw error;
-              this.store.recordAudit(
-                "response_draft.failed",
-                "decision",
-                decision.id,
-                draftError.slice(0, 2_000),
-              );
-              this.logger.warn("response_draft.failed", {
-                decisionId: decision.id,
-                templateId: template.id,
-                error: draftError.slice(0, 1_000),
-              });
-            }
-          }
+        if (this.classifier !== undefined) {
+          this.store.enqueueLlmRunForJob(
+            job.id,
+            leaseToken,
+            { ...this.classifier.describe(group, stored.post), scanId: scan.id },
+            this.config.llmRunMaxAttempts,
+          );
         }
       }
       if (leaseLost) throw new Error(`Job lease lost: ${job.id}`);
@@ -319,6 +509,59 @@ export class AgentWorker {
       clearInterval(heartbeat);
     }
   }
+}
+
+function requiredLlmLeaseToken(run: LlmRun): string {
+  if (run.leaseToken === undefined) throw new Error(`Claimed LLM run has no lease token: ${run.id}`);
+  return run.leaseToken;
+}
+
+function matchesLlmDescriptor(run: LlmRun, descriptor: LlmWorkDescriptor): boolean {
+  return run.operation === descriptor.operation &&
+    run.entityId === descriptor.entityId &&
+    run.groupId === descriptor.groupId &&
+    run.templateId === descriptor.templateId &&
+    run.model === descriptor.model &&
+    run.promptVersion === descriptor.promptVersion &&
+    run.inputHash === descriptor.inputHash &&
+    run.sourceVersion === descriptor.sourceVersion;
+}
+
+function classifyLlmFailure(error: unknown): {
+  category: LlmErrorCategory;
+  retryable: boolean;
+  retryAfterMs?: number;
+  requestAttempts?: number;
+} {
+  if (error instanceof LlmRequestError) {
+    return {
+      category: error.category,
+      retryable: error.retryable,
+      requestAttempts: error.attempts,
+      ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+    };
+  }
+  const message = errorMessage(error);
+  if (
+    message.startsWith("LLM classification") ||
+    message.startsWith("Generated response draft")
+  ) {
+    return { category: "invalid_response", retryable: true };
+  }
+  if (
+    message.startsWith("Response template changed") ||
+    message.startsWith("LLM source changed during request:") ||
+    message.includes("no longer eligible") ||
+    message.startsWith("Unknown response template:")
+  ) {
+    return { category: "stale_input", retryable: false };
+  }
+  return { category: "operation_failed", retryable: false };
+}
+
+function llmRetryTime(attempts: number, retryAfterMs?: number): string {
+  const exponential = Math.min(300_000, 5_000 * 2 ** Math.max(0, attempts - 1));
+  return new Date(Date.now() + Math.max(exponential, retryAfterMs ?? 0)).toISOString();
 }
 
 function requiredLeaseToken(job: AgentJob): string {

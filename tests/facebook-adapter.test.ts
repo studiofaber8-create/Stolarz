@@ -35,6 +35,9 @@ const config: AppConfig = {
     pollIntervalMs: 1_000,
     leaseMs: 60_000,
     reviewThreshold: 0.8,
+    llmDailyTokenBudget: 200_000,
+    llmScanTokenBudget: 25_000,
+    llmRunMaxAttempts: 3,
     businessDescription: "test",
   },
 };

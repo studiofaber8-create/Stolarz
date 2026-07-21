@@ -3,6 +3,76 @@ export type ScanRunStatus = "running" | "succeeded" | "failed" | "auth_required"
 export type DecisionStatus = "ignored" | "review";
 export type JobStatus = "queued" | "running" | "succeeded" | "dead";
 export type ExtractionHealth = "unknown" | "healthy" | "empty" | "suspected_drift" | "error";
+export type LlmRunOperation = "classification" | "draft";
+export type LlmRunStatus = "queued" | "running" | "succeeded" | "failed" | "skipped_budget";
+export type LlmErrorCategory =
+  | "rate_limited"
+  | "server_error"
+  | "timeout"
+  | "network"
+  | "invalid_response"
+  | "client_error"
+  | "stale_input"
+  | "budget_daily"
+  | "budget_scan"
+  | "operation_failed";
+
+export interface LlmWorkDescriptor {
+  readonly operation: LlmRunOperation;
+  readonly entityId: string;
+  readonly groupId: string;
+  readonly scanId?: string;
+  readonly templateId?: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly inputHash: string;
+  readonly sourceVersion: string;
+  readonly reservedTokens: number;
+}
+
+export interface LlmRun {
+  readonly id: string;
+  readonly operation: LlmRunOperation;
+  readonly entityId: string;
+  readonly groupId: string;
+  readonly scanId?: string;
+  readonly templateId?: string;
+  readonly idempotencyKey: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly inputHash: string;
+  readonly sourceVersion: string;
+  readonly status: LlmRunStatus;
+  readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly availableAt: string;
+  readonly leaseOwner?: string;
+  readonly leaseUntil?: string;
+  readonly leaseToken?: string;
+  readonly reservedTokens: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly latencyMs?: number;
+  readonly errorCategory?: LlmErrorCategory;
+  readonly error?: string;
+  readonly retryable?: boolean;
+  readonly requestAttempts?: number;
+  readonly startedAt?: string;
+  readonly completedAt?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface LlmQueueSummary {
+  readonly queued: number;
+  readonly running: number;
+  readonly succeeded: number;
+  readonly failed: number;
+  readonly skippedBudget: number;
+  readonly tokensToday: number;
+  readonly reservedToday: number;
+}
+
 export type RecordedFacebookAuthState =
   | "unknown"
   | "authenticated"
@@ -98,6 +168,7 @@ export interface LeadDecisionInput {
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly latencyMs: number;
+  readonly requestAttempts?: number;
 }
 
 export interface ResponseTemplate {
@@ -150,6 +221,7 @@ export interface ResponseDraftInput {
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly latencyMs: number;
+  readonly requestAttempts?: number;
 }
 
 export interface ScanRun {
@@ -201,6 +273,10 @@ export interface MonitoringSummary {
   readonly responseDrafts: number;
   readonly extractionDriftGroups: number;
   readonly extractionErrorGroups: number;
+  readonly queuedLlmRuns: number;
+  readonly failedLlmRuns: number;
+  readonly skippedBudgetLlmRuns: number;
+  readonly llmTokensToday: number;
   readonly lastSuccessfulScanAt?: string;
 }
 

@@ -27,6 +27,8 @@
         <article class="metric card"><span>Grupy</span><strong id="group-count">0</strong></article>
         <article class="metric card"><span>Joby w kolejce</span><strong id="queued-count">0</strong></article>
         <article class="metric card"><span>Do przeglądu</span><strong id="review-count">0</strong></article>
+        <article class="metric card"><span>LLM w kolejce</span><strong id="llm-queued-count">0</strong></article>
+        <article class="metric card"><span>Tokeny LLM dzisiaj</span><strong id="llm-token-count">0</strong></article>
         <article class="metric card"><span>Worker / LLM</span><strong class="small" id="agent-status">—</strong><button class="secondary" id="test-llm" type="button">Test LLM</button></article>
       </section>
 
@@ -94,6 +96,14 @@
           <div id="scans" class="feed"></div>
           <div id="scans-empty" class="empty card">Brak wykonanych skanów.</div>
         </div>
+      </section>
+      <section class="workspace">
+        <div class="section-heading">
+          <div><p class="eyebrow">LLM PIPELINE</p><h2>Trwałe operacje i kontrola kosztów</h2></div>
+          <p class="muted" id="llm-budget-status">—</p>
+        </div>
+        <div id="llm-runs" class="feed"></div>
+        <div id="llm-runs-empty" class="empty card">Brak operacji LLM.</div>
       </section>
       <section class="workspace">
         <div class="section-heading"><div><p class="eyebrow">AUDYT</p><h2>Ostatnie zdarzenia operacyjne</h2></div></div>

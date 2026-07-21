@@ -43,7 +43,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 1.2rem 1.5rem 4rem; }
 .auth p, .muted { color: var(--muted); font-size: .82rem; line-height: 1.5; }
 .inline-form { display: flex; gap: .7rem; min-width: min(100%, 440px); }
 .inline-form input { margin: 0; }
-.summary-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .75rem; margin-bottom: 2.4rem; }
+.summary-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: .75rem; margin-bottom: 2.4rem; }
 .metric { padding: 1rem; display: flex; flex-direction: column; gap: .4rem; min-height: 104px; }
 .metric span { color: var(--muted); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }
 .metric strong { font-size: 1.7rem; overflow-wrap: anywhere; }

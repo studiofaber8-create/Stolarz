@@ -8,6 +8,9 @@ export interface LlmConfig {
   readonly model: string;
   readonly format: LlmApiFormat;
   readonly timeoutMs: number;
+  readonly maxAttempts: number;
+  readonly retryBaseMs: number;
+  readonly retryMaxMs: number;
   readonly anthropicVersion: string;
 }
 
@@ -17,6 +20,9 @@ export interface AgentConfig {
   readonly pollIntervalMs: number;
   readonly leaseMs: number;
   readonly reviewThreshold: number;
+  readonly llmDailyTokenBudget: number;
+  readonly llmScanTokenBudget: number;
+  readonly llmRunMaxAttempts: number;
   readonly businessDescription: string;
 }
 
@@ -150,6 +156,25 @@ function agentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       0,
       1,
     ),
+    llmDailyTokenBudget: positiveInteger(
+      "AGENT_LLM_DAILY_TOKEN_BUDGET",
+      env.AGENT_LLM_DAILY_TOKEN_BUDGET,
+      200_000,
+      100_000_000,
+    ),
+    llmScanTokenBudget: positiveInteger(
+      "AGENT_LLM_SCAN_TOKEN_BUDGET",
+      env.AGENT_LLM_SCAN_TOKEN_BUDGET,
+      25_000,
+      10_000_000,
+    ),
+    llmRunMaxAttempts: rangedInteger(
+      "AGENT_LLM_RUN_MAX_ATTEMPTS",
+      env.AGENT_LLM_RUN_MAX_ATTEMPTS,
+      3,
+      1,
+      10,
+    ),
     businessDescription:
       optional(env.AGENT_BUSINESS_DESCRIPTION) ??
       "Wykonujemy meble i zabudowy na wymiar: kuchnie, szafy, garderoby i zabudowy stolarskie.",
@@ -168,12 +193,20 @@ function llmConfig(env: NodeJS.ProcessEnv): LlmConfig | undefined {
   if (format !== "anthropic" && format !== "openai-compatible") {
     throw new Error("LLM_API_FORMAT must be anthropic or openai-compatible");
   }
+  const retryBaseMs = positiveInteger("LLM_RETRY_BASE_MS", env.LLM_RETRY_BASE_MS, 500, 60_000);
+  const retryMaxMs = positiveInteger("LLM_RETRY_MAX_MS", env.LLM_RETRY_MAX_MS, 10_000, 300_000);
+  if (retryMaxMs < retryBaseMs) {
+    throw new Error("LLM_RETRY_MAX_MS must be greater than or equal to LLM_RETRY_BASE_MS");
+  }
   return {
     apiUrl: normalizedSecretUrl("LLM_API_URL", apiUrl),
     apiKey,
     model: optional(env.LLM_MODEL) ?? "claude-opus-4-8",
     format,
     timeoutMs: positiveInteger("LLM_REQUEST_TIMEOUT_MS", env.LLM_REQUEST_TIMEOUT_MS, 120_000),
+    maxAttempts: rangedInteger("LLM_RETRY_MAX_ATTEMPTS", env.LLM_RETRY_MAX_ATTEMPTS, 3, 1, 10),
+    retryBaseMs,
+    retryMaxMs,
     anthropicVersion: optional(env.LLM_ANTHROPIC_VERSION) ?? "2023-06-01",
   };
 }

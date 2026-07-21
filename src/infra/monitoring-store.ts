@@ -4,6 +4,10 @@ import path from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { renderSpintax } from "../agent/spintax.js";
 import {
+  classificationSourceVersion,
+  draftSourceVersion,
+} from "../llm/llm-source-version.js";
+import {
   assertAccountId,
   assertLabel,
   type AccountRepository,
@@ -19,6 +23,10 @@ import type {
   ExtractionHealth,
   LeadDecision,
   LeadDecisionInput,
+  LlmErrorCategory,
+  LlmQueueSummary,
+  LlmRun,
+  LlmWorkDescriptor,
   MonitoredGroup,
   MonitoringSummary,
   ResponseDraft,
@@ -427,6 +435,12 @@ export class MonitoringStore implements AccountRepository {
     this.transaction(() => {
       const group = this.database.prepare("SELECT id FROM monitored_groups WHERE id = ?").get(groupId);
       if (group === undefined) throw new Error(`Unknown group: ${groupId}`);
+      const activeLlmRun = this.database.prepare(`
+        SELECT id FROM llm_runs WHERE group_id = ? AND status = 'running' LIMIT 1
+      `).get(groupId);
+      if (activeLlmRun !== undefined) {
+        throw new Error(`Group has active LLM runs: ${groupId}`);
+      }
       this.database.prepare("DELETE FROM monitored_groups WHERE id = ?").run(groupId);
     });
     this.recordAudit("group.deleted", "group", groupId);
@@ -1057,7 +1071,11 @@ export class MonitoringStore implements AccountRepository {
       ON CONFLICT(group_id, external_id) DO UPDATE SET
         url = excluded.url, author = excluded.author, content = excluded.content,
         content_hash = excluded.content_hash, published_at = COALESCE(excluded.published_at, posts.published_at),
-        updated_at = excluded.updated_at
+        updated_at = CASE
+          WHEN posts.content_hash <> excluded.content_hash
+            OR posts.url <> excluded.url
+            OR COALESCE(posts.author, '') <> COALESCE(excluded.author, '')
+          THEN excluded.updated_at ELSE posts.updated_at END
     `).run(
       id,
       groupId,
@@ -1095,6 +1113,48 @@ export class MonitoringStore implements AccountRepository {
           "SELECT * FROM posts WHERE group_id = ? ORDER BY discovered_at DESC LIMIT ?",
         ).all(groupId, safeLimit);
     return rows.map(postFromRow);
+  }
+
+  public listPostsNeedingClassification(limit = 100): StoredPost[] {
+    const safeLimit = boundedInteger("limit", limit, 1, 500);
+    return this.database.prepare(`
+      SELECT posts.* FROM posts
+      INNER JOIN monitored_groups ON monitored_groups.id = posts.group_id
+      INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+      LEFT JOIN lead_decisions ON lead_decisions.post_id = posts.id
+      WHERE monitored_groups.enabled = 1 AND accounts.enabled = 1
+        AND (lead_decisions.id IS NULL OR posts.updated_at > lead_decisions.created_at)
+        AND NOT EXISTS (
+          SELECT 1 FROM llm_runs
+          WHERE llm_runs.operation = 'classification'
+            AND llm_runs.entity_id = posts.id
+            AND llm_runs.created_at >= posts.updated_at
+        )
+      ORDER BY posts.updated_at ASC
+      LIMIT ?
+    `).all(safeLimit).map(postFromRow);
+  }
+
+  public listDecisionsNeedingDraft(limit = 100): LeadDecision[] {
+    const safeLimit = boundedInteger("limit", limit, 1, 500);
+    return this.database.prepare(`
+      SELECT lead_decisions.* FROM lead_decisions
+      INNER JOIN posts ON posts.id = lead_decisions.post_id
+      INNER JOIN monitored_groups ON monitored_groups.id = posts.group_id
+      INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+      LEFT JOIN response_drafts ON response_drafts.decision_id = lead_decisions.id
+      WHERE lead_decisions.status = 'review' AND response_drafts.id IS NULL
+        AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM llm_runs
+          WHERE llm_runs.operation = 'draft'
+            AND llm_runs.entity_id = lead_decisions.id
+            AND llm_runs.status IN ('queued','running')
+            AND llm_runs.created_at >= lead_decisions.created_at
+        )
+      ORDER BY lead_decisions.created_at ASC
+      LIMIT ?
+    `).all(safeLimit).map(decisionFromRow);
   }
 
   public hasDecision(postId: string): boolean {
@@ -1365,6 +1425,475 @@ export class MonitoringStore implements AccountRepository {
     ).all(safeLimit).map(responseDraftFromRow);
   }
 
+  public getPost(postId: string): StoredPost {
+    const row = this.database.prepare("SELECT * FROM posts WHERE id = ?").get(postId);
+    if (row === undefined) throw new Error(`Unknown post: ${postId}`);
+    return postFromRow(row);
+  }
+
+  public getDecision(decisionId: string): LeadDecision {
+    const row = this.database.prepare("SELECT * FROM lead_decisions WHERE id = ?").get(decisionId);
+    if (row === undefined) throw new Error(`Unknown decision: ${decisionId}`);
+    return decisionFromRow(row);
+  }
+
+  public findClassificationScanId(postId: string): string | undefined {
+    const row = this.database.prepare(`
+      SELECT scan_id FROM llm_runs
+      WHERE operation = 'classification' AND entity_id = ? AND status = 'succeeded'
+        AND scan_id IS NOT NULL
+      ORDER BY completed_at DESC LIMIT 1
+    `).get(postId);
+    return row === undefined ? undefined : nullableString(row.scan_id);
+  }
+
+  public enqueueLlmRun(
+    descriptor: LlmWorkDescriptor,
+    maxAttempts: number,
+  ): LlmRun {
+    return this.transaction(() => this.enqueueLlmRunInternal(descriptor, maxAttempts));
+  }
+
+  public enqueueLlmRunForJob(
+    jobId: string,
+    leaseToken: string,
+    descriptor: LlmWorkDescriptor,
+    maxAttempts: number,
+  ): LlmRun {
+    return this.transaction(() => {
+      this.assertJobLease(jobId, leaseToken);
+      return this.enqueueLlmRunInternal(descriptor, maxAttempts);
+    });
+  }
+
+  private enqueueLlmRunInternal(
+    descriptor: LlmWorkDescriptor,
+    maxAttempts: number,
+  ): LlmRun {
+    const operation = descriptor.operation;
+    const entityId = boundedText("LLM entityId", descriptor.entityId, 1, 500);
+    const groupId = boundedText("LLM groupId", descriptor.groupId, 1, 500);
+    const model = boundedText("LLM model", descriptor.model, 1, 200);
+    const promptVersion = boundedText("LLM promptVersion", descriptor.promptVersion, 1, 100);
+    const inputHash = boundedText("LLM inputHash", descriptor.inputHash, 64, 64);
+    const sourceVersion = boundedText("LLM sourceVersion", descriptor.sourceVersion, 64, 64);
+    const reservedTokens = boundedInteger(
+      "LLM reservedTokens",
+      descriptor.reservedTokens,
+      1,
+      1_000_000,
+    );
+    const safeMaxAttempts = boundedInteger("LLM maxAttempts", maxAttempts, 1, 10);
+    const idempotencyKey = createHash("sha256").update(JSON.stringify({
+      operation,
+      entityId,
+      groupId,
+      templateId: descriptor.templateId ?? null,
+      model,
+      promptVersion,
+      inputHash,
+      sourceVersion,
+    })).digest("hex");
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO llm_runs (
+        id, operation, entity_id, group_id, scan_id, template_id, idempotency_key,
+        model, prompt_version, input_hash, source_version, status, attempts, max_attempts,
+        available_at, reserved_tokens, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
+      ON CONFLICT(idempotency_key) DO UPDATE SET
+        scan_id = COALESCE(llm_runs.scan_id, excluded.scan_id)
+    `).run(
+      randomUUID(),
+      operation,
+      entityId,
+      groupId,
+      descriptor.scanId ?? null,
+      descriptor.templateId ?? null,
+      idempotencyKey,
+      model,
+      promptVersion,
+      inputHash,
+      sourceVersion,
+      safeMaxAttempts,
+      now,
+      reservedTokens,
+      now,
+      now,
+    );
+    const row = this.database.prepare(
+      "SELECT * FROM llm_runs WHERE idempotency_key = ?",
+    ).get(idempotencyKey);
+    if (row === undefined) throw new Error("Failed to enqueue LLM run");
+    return llmRunFromRow(row);
+  }
+
+  public claimNextLlmRun(
+    workerId: string,
+    leaseMs: number,
+    dailyTokenBudget: number,
+    scanTokenBudget: number,
+  ): LlmRun | undefined {
+    boundedText("LLM workerId", workerId, 1, 120);
+    boundedInteger("LLM leaseMs", leaseMs, 1_000, 3_600_000);
+    boundedInteger("LLM dailyTokenBudget", dailyTokenBudget, 1, 100_000_000);
+    boundedInteger("LLM scanTokenBudget", scanTokenBudget, 1, 10_000_000);
+    return this.transaction(() => {
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const dayStart = new Date(Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+      )).toISOString();
+      this.database.prepare(`
+        INSERT INTO llm_usage_charges (id, run_id, scan_id, tokens, kind, created_at)
+        SELECT lower(hex(randomblob(16))), id, scan_id, reserved_tokens, 'lease_expired', ?
+        FROM llm_runs
+        WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until < ?
+      `).run(nowIso, nowIso);
+      this.database.prepare(`
+        UPDATE llm_runs
+        SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
+            lease_owner = NULL, lease_until = NULL, lease_token = NULL,
+            error_category = 'operation_failed', error = 'LLM run lease expired',
+            retryable = CASE WHEN attempts >= max_attempts THEN 0 ELSE 1 END,
+            completed_at = CASE WHEN attempts >= max_attempts THEN ? ELSE NULL END,
+            available_at = ?, updated_at = ?
+        WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until < ?
+      `).run(nowIso, nowIso, nowIso, nowIso);
+
+      while (true) {
+        const row = this.database.prepare(`
+          SELECT llm_runs.* FROM llm_runs
+          INNER JOIN monitored_groups ON monitored_groups.id = llm_runs.group_id
+          INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+          WHERE llm_runs.status = 'queued' AND llm_runs.available_at <= ?
+            AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+          ORDER BY llm_runs.available_at ASC, llm_runs.created_at ASC
+          LIMIT 1
+        `).get(nowIso);
+        if (row === undefined) return undefined;
+        const candidate = llmRunFromRow(row);
+        const dailyUsage = numeric(this.database.prepare(`
+          SELECT
+            (SELECT COALESCE(SUM(tokens), 0) FROM llm_usage_charges WHERE created_at >= ?) +
+            (SELECT COALESCE(SUM(reserved_tokens), 0) FROM llm_runs WHERE status = 'running')
+            AS total
+        `).get(dayStart)!.total);
+        const scanUsage = candidate.scanId === undefined
+          ? 0
+          : numeric(this.database.prepare(`
+              SELECT
+                (SELECT COALESCE(SUM(tokens), 0)
+                  FROM llm_usage_charges WHERE scan_id = ?) +
+                (SELECT COALESCE(SUM(reserved_tokens), 0)
+                  FROM llm_runs WHERE scan_id = ? AND status = 'running')
+                AS total
+            `).get(candidate.scanId, candidate.scanId)!.total);
+        const budgetCategory = dailyUsage + candidate.reservedTokens > dailyTokenBudget
+          ? "budget_daily"
+          : scanUsage + candidate.reservedTokens > scanTokenBudget
+            ? "budget_scan"
+            : undefined;
+        if (budgetCategory !== undefined) {
+          this.database.prepare(`
+            UPDATE llm_runs
+            SET status = 'skipped_budget', error_category = ?,
+                error = ?, retryable = 1, completed_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'queued'
+          `).run(
+            budgetCategory,
+            budgetCategory === "budget_daily"
+              ? "Daily LLM token budget exceeded"
+              : "Per-scan LLM token budget exceeded",
+            nowIso,
+            nowIso,
+            candidate.id,
+          );
+          this.recordAudit(
+            "llm.skipped_budget",
+            "llm_run",
+            candidate.id,
+            `${budgetCategory}: reserved=${candidate.reservedTokens}`,
+          );
+          continue;
+        }
+        const leaseToken = randomUUID();
+        const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+        const claimed = this.database.prepare(`
+          UPDATE llm_runs
+          SET status = 'running', attempts = attempts + 1, lease_owner = ?,
+              lease_until = ?, lease_token = ?, started_at = ?, completed_at = NULL,
+              error_category = NULL, error = NULL, retryable = NULL, updated_at = ?
+          WHERE id = ? AND status = 'queued' AND available_at <= ?
+        `).run(workerId, leaseUntil, leaseToken, nowIso, nowIso, candidate.id, nowIso);
+        if (claimed.changes === 0) continue;
+        return llmRunFromRow(this.database.prepare(
+          "SELECT * FROM llm_runs WHERE id = ?",
+        ).get(candidate.id)!);
+      }
+      return undefined;
+    });
+  }
+
+  public extendLlmRunLease(runId: string, leaseToken: string, leaseMs: number): void {
+    const now = new Date();
+    const result = this.database.prepare(`
+      UPDATE llm_runs SET lease_until = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND lease_token = ? AND lease_until >= ?
+        AND EXISTS (
+          SELECT 1 FROM monitored_groups
+          INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+          WHERE monitored_groups.id = llm_runs.group_id
+            AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+        )
+    `).run(
+      new Date(now.getTime() + leaseMs).toISOString(),
+      now.toISOString(),
+      runId,
+      leaseToken,
+      now.toISOString(),
+    );
+    if (result.changes === 0) throw new Error(`LLM run lease lost: ${runId}`);
+  }
+
+  public completeClassificationLlmRun(
+    runId: string,
+    leaseToken: string,
+    input: LeadDecisionInput,
+  ): LeadDecision {
+    return this.transaction(() => {
+      const run = this.assertLlmRunLease(runId, leaseToken, "classification");
+      if (input.postId !== run.entityId) throw new Error(`LLM run entity changed: ${runId}`);
+      const currentPost = this.getPost(input.postId);
+      const currentGroup = this.getGroup(currentPost.groupId);
+      if (classificationSourceVersion(currentGroup, currentPost) !== run.sourceVersion) {
+        throw new Error(`LLM source changed during request: ${runId}`);
+      }
+      const decision = this.saveDecisionInternal(input);
+      this.completeLlmRunInternal(
+        run,
+        input.inputTokens,
+        input.outputTokens,
+        input.latencyMs,
+        input.requestAttempts ?? 1,
+      );
+      if (run.scanId !== undefined) {
+        this.database.prepare(`
+          UPDATE scan_runs SET decisions_created = decisions_created + 1 WHERE id = ?
+        `).run(run.scanId);
+      }
+      return decision;
+    });
+  }
+
+  public completeDraftLlmRun(
+    runId: string,
+    leaseToken: string,
+    input: ResponseDraftInput,
+  ): ResponseDraft {
+    return this.transaction(() => {
+      const run = this.assertLlmRunLease(runId, leaseToken, "draft");
+      if (input.decisionId !== run.entityId || input.templateId !== run.templateId) {
+        throw new Error(`LLM run entity changed: ${runId}`);
+      }
+      const currentDecision = this.getDecision(input.decisionId);
+      const currentPost = this.getPost(currentDecision.postId);
+      const currentGroup = this.getGroup(currentPost.groupId);
+      const currentTemplate = this.getResponseTemplate(input.templateId);
+      if (
+        draftSourceVersion(currentTemplate, currentGroup, currentPost, currentDecision) !==
+        run.sourceVersion
+      ) {
+        throw new Error(`LLM source changed during request: ${runId}`);
+      }
+      const draft = this.saveResponseDraftInternal(input);
+      this.completeLlmRunInternal(
+        run,
+        input.inputTokens,
+        input.outputTokens,
+        input.latencyMs,
+        input.requestAttempts ?? 1,
+      );
+      return draft;
+    });
+  }
+
+  private completeLlmRunInternal(
+    run: LlmRun,
+    inputTokens: number | undefined,
+    outputTokens: number | undefined,
+    latencyMs: number,
+    requestAttempts: number,
+  ): void {
+    const now = new Date().toISOString();
+    const safeInputTokens = inputTokens === undefined
+      ? undefined
+      : boundedInteger("LLM inputTokens", inputTokens, 0, 100_000_000);
+    const safeOutputTokens = outputTokens === undefined
+      ? undefined
+      : boundedInteger("LLM outputTokens", outputTokens, 0, 100_000_000);
+    const chargedTokens = safeInputTokens === undefined || safeOutputTokens === undefined
+      ? run.reservedTokens
+      : safeInputTokens + safeOutputTokens;
+    this.recordLlmUsageCharge(run, chargedTokens, "success", now);
+    this.database.prepare(`
+      UPDATE llm_runs
+      SET status = 'succeeded', input_tokens = ?, output_tokens = ?, latency_ms = ?,
+          request_attempts = ?,
+          lease_owner = NULL, lease_until = NULL, lease_token = NULL,
+          retryable = NULL, completed_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'running'
+    `).run(
+      safeInputTokens ?? null,
+      safeOutputTokens ?? null,
+      boundedInteger("LLM latencyMs", latencyMs, 0, 3_600_000),
+      boundedInteger("LLM requestAttempts", requestAttempts, 1, 100),
+      now,
+      now,
+      run.id,
+    );
+  }
+
+  private recordLlmUsageCharge(
+    run: LlmRun,
+    tokens: number,
+    kind: "success" | "failure",
+    createdAt: string,
+  ): void {
+    this.database.prepare(`
+      INSERT INTO llm_usage_charges (id, run_id, scan_id, tokens, kind, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(),
+      run.id,
+      run.scanId ?? null,
+      boundedInteger("LLM charged tokens", tokens, 0, 200_000_000),
+      kind,
+      createdAt,
+    );
+  }
+
+  public failLlmRun(
+    runId: string,
+    leaseToken: string,
+    category: LlmErrorCategory,
+    error: string,
+    retryable: boolean,
+    retryAt: string,
+    requestAttempts?: number,
+  ): LlmRun {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const run = this.assertLlmRunLease(runId, leaseToken);
+      const willRetry = retryable && run.attempts < run.maxAttempts;
+      this.recordLlmUsageCharge(run, run.reservedTokens, "failure", now);
+      this.database.prepare(`
+        UPDATE llm_runs
+        SET status = ?, available_at = ?, lease_owner = NULL, lease_until = NULL,
+            lease_token = NULL, error_category = ?, error = ?, retryable = ?,
+            request_attempts = COALESCE(?, request_attempts),
+            completed_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END, updated_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(
+        willRetry ? "queued" : "failed",
+        retryAt,
+        category,
+        boundedText("LLM error", error, 1, 2_000),
+        retryable ? 1 : 0,
+        requestAttempts === undefined
+          ? null
+          : boundedInteger("LLM requestAttempts", requestAttempts, 1, 100),
+        willRetry ? "queued" : "failed",
+        now,
+        now,
+        run.id,
+      );
+      return this.getLlmRun(run.id);
+    });
+  }
+
+  public replayLlmRun(runId: string): LlmRun {
+    const now = new Date().toISOString();
+    const result = this.database.prepare(`
+      UPDATE llm_runs
+      SET status = 'queued', attempts = 0, available_at = ?, lease_owner = NULL,
+          lease_until = NULL, lease_token = NULL, error_category = NULL, error = NULL,
+          retryable = NULL, request_attempts = NULL, started_at = NULL,
+          completed_at = NULL, updated_at = ?
+      WHERE id = ? AND status IN ('failed','skipped_budget')
+    `).run(now, now, runId);
+    if (result.changes === 0) {
+      const existing = this.database.prepare("SELECT status FROM llm_runs WHERE id = ?").get(runId);
+      if (existing === undefined) throw new Error(`Unknown LLM run: ${runId}`);
+      throw new Error(`LLM run cannot be replayed from status: ${requiredString(existing.status)}`);
+    }
+    this.recordAudit("llm.replayed", "llm_run", runId);
+    return this.getLlmRun(runId);
+  }
+
+  public listLlmRuns(limit = 100): LlmRun[] {
+    const safeLimit = boundedInteger("limit", limit, 1, 500);
+    return this.database.prepare(
+      "SELECT * FROM llm_runs ORDER BY created_at DESC LIMIT ?",
+    ).all(safeLimit).map(llmRunFromRow);
+  }
+
+  public llmQueueSummary(): LlmQueueSummary {
+    const dayStart = new Date();
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const row = this.database.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'queued') AS queued,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'running') AS running,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'succeeded') AS succeeded,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'failed') AS failed,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'skipped_budget') AS skipped_budget,
+        (SELECT COALESCE(SUM(tokens), 0)
+          FROM llm_usage_charges WHERE created_at >= ?) AS tokens_today,
+        (SELECT COALESCE(SUM(reserved_tokens), 0) FROM llm_runs
+          WHERE status = 'running') AS reserved_today
+    `).get(dayStart.toISOString());
+    if (row === undefined) throw new Error("Failed to calculate LLM queue summary");
+    return {
+      queued: numeric(row.queued),
+      running: numeric(row.running),
+      succeeded: numeric(row.succeeded),
+      failed: numeric(row.failed),
+      skippedBudget: numeric(row.skipped_budget),
+      tokensToday: numeric(row.tokens_today),
+      reservedToday: numeric(row.reserved_today),
+    };
+  }
+
+  private getLlmRun(runId: string): LlmRun {
+    const row = this.database.prepare("SELECT * FROM llm_runs WHERE id = ?").get(runId);
+    if (row === undefined) throw new Error(`Unknown LLM run: ${runId}`);
+    return llmRunFromRow(row);
+  }
+
+  private assertLlmRunLease(
+    runId: string,
+    leaseToken: string,
+    operation?: LlmRun["operation"],
+  ): LlmRun {
+    const row = this.database.prepare(`
+      SELECT llm_runs.* FROM llm_runs
+      INNER JOIN monitored_groups ON monitored_groups.id = llm_runs.group_id
+      INNER JOIN accounts ON accounts.id = monitored_groups.account_id
+      WHERE llm_runs.id = ? AND llm_runs.status = 'running'
+        AND llm_runs.lease_token = ? AND llm_runs.lease_until >= ?
+        AND monitored_groups.enabled = 1 AND accounts.enabled = 1
+    `).get(runId, leaseToken, new Date().toISOString());
+    if (row === undefined) throw new Error(`LLM run lease lost: ${runId}`);
+    const run = llmRunFromRow(row);
+    if (operation !== undefined && run.operation !== operation) {
+      throw new Error(`Unexpected LLM run operation: ${run.operation}`);
+    }
+    return run;
+  }
+
   public summary(): MonitoringSummary {
     const counts = this.database.prepare(`
       SELECT
@@ -1381,6 +1910,12 @@ export class MonitoringStore implements AccountRepository {
           AS extraction_drift_groups,
         (SELECT COUNT(*) FROM monitored_groups WHERE extraction_health = 'error')
           AS extraction_error_groups,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'queued') AS queued_llm_runs,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'failed') AS failed_llm_runs,
+        (SELECT COUNT(*) FROM llm_runs WHERE status = 'skipped_budget') AS skipped_budget_llm_runs,
+        (SELECT COALESCE(SUM(tokens), 0)
+          FROM llm_usage_charges
+          WHERE created_at >= strftime('%Y-%m-%dT00:00:00.000Z', 'now')) AS llm_tokens_today,
         (SELECT MAX(completed_at) FROM scan_runs WHERE status = 'succeeded') AS last_successful_scan_at
     `).get();
     if (counts === undefined) throw new Error("Failed to calculate monitoring summary");
@@ -1397,6 +1932,10 @@ export class MonitoringStore implements AccountRepository {
       responseDrafts: numeric(counts.response_drafts),
       extractionDriftGroups: numeric(counts.extraction_drift_groups),
       extractionErrorGroups: numeric(counts.extraction_error_groups),
+      queuedLlmRuns: numeric(counts.queued_llm_runs),
+      failedLlmRuns: numeric(counts.failed_llm_runs),
+      skippedBudgetLlmRuns: numeric(counts.skipped_budget_llm_runs),
+      llmTokensToday: numeric(counts.llm_tokens_today),
       ...(lastSuccessfulScanAt === undefined ? {} : { lastSuccessfulScanAt }),
     };
   }
@@ -1743,6 +2282,63 @@ const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    name: "add_durable_llm_runs",
+    up(db) {
+      db.exec(`
+        CREATE TABLE llm_runs (
+          id TEXT PRIMARY KEY,
+          operation TEXT NOT NULL CHECK(operation IN ('classification','draft')),
+          entity_id TEXT NOT NULL,
+          group_id TEXT NOT NULL REFERENCES monitored_groups(id) ON DELETE CASCADE,
+          scan_id TEXT REFERENCES scan_runs(id) ON DELETE SET NULL,
+          template_id TEXT REFERENCES response_templates(id) ON DELETE SET NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          model TEXT NOT NULL,
+          prompt_version TEXT NOT NULL,
+          input_hash TEXT NOT NULL,
+          source_version TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','skipped_budget')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL,
+          available_at TEXT NOT NULL,
+          lease_owner TEXT,
+          lease_until TEXT,
+          lease_token TEXT,
+          reserved_tokens INTEGER NOT NULL,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          latency_ms INTEGER,
+          request_attempts INTEGER,
+          error_category TEXT,
+          error TEXT,
+          retryable INTEGER,
+          started_at TEXT,
+          completed_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX llm_runs_claim_idx ON llm_runs(status, available_at, created_at);
+        CREATE INDEX llm_runs_usage_idx ON llm_runs(status, completed_at, started_at);
+        CREATE INDEX llm_runs_scan_idx ON llm_runs(scan_id, status);
+        CREATE INDEX llm_runs_entity_idx ON llm_runs(operation, entity_id, created_at DESC);
+
+        CREATE TABLE llm_usage_charges (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          scan_id TEXT,
+          tokens INTEGER NOT NULL CHECK(tokens >= 0),
+          kind TEXT NOT NULL CHECK(kind IN ('success','failure','lease_expired')),
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX llm_usage_charges_day_idx
+          ON llm_usage_charges(created_at, run_id);
+        CREATE INDEX llm_usage_charges_scan_idx
+          ON llm_usage_charges(scan_id, created_at);
+      `);
+    },
+  },
 ];
 
 function accountFromRow(row: Record<string, SQLOutputValue>): FacebookAccount {
@@ -1910,6 +2506,57 @@ function responseDraftFromRow(row: Record<string, SQLOutputValue>): ResponseDraf
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     latencyMs: numeric(row.latency_ms),
+    createdAt: requiredString(row.created_at),
+    updatedAt: requiredString(row.updated_at),
+  };
+}
+
+function llmRunFromRow(row: Record<string, SQLOutputValue>): LlmRun {
+  const scanId = nullableString(row.scan_id);
+  const templateId = nullableString(row.template_id);
+  const leaseOwner = nullableString(row.lease_owner);
+  const leaseUntil = nullableString(row.lease_until);
+  const leaseToken = nullableString(row.lease_token);
+  const inputTokens = nullableNumber(row.input_tokens);
+  const outputTokens = nullableNumber(row.output_tokens);
+  const latencyMs = nullableNumber(row.latency_ms);
+  const requestAttempts = nullableNumber(row.request_attempts);
+  const errorCategory = nullableString(row.error_category);
+  const error = nullableString(row.error);
+  const retryable = nullableNumber(row.retryable);
+  const startedAt = nullableString(row.started_at);
+  const completedAt = nullableString(row.completed_at);
+  return {
+    id: requiredString(row.id),
+    operation: requiredString(row.operation) as LlmRun["operation"],
+    entityId: requiredString(row.entity_id),
+    groupId: requiredString(row.group_id),
+    ...(scanId === undefined ? {} : { scanId }),
+    ...(templateId === undefined ? {} : { templateId }),
+    idempotencyKey: requiredString(row.idempotency_key),
+    model: requiredString(row.model),
+    promptVersion: requiredString(row.prompt_version),
+    inputHash: requiredString(row.input_hash),
+    sourceVersion: requiredString(row.source_version),
+    status: requiredString(row.status) as LlmRun["status"],
+    attempts: numeric(row.attempts),
+    maxAttempts: numeric(row.max_attempts),
+    availableAt: requiredString(row.available_at),
+    ...(leaseOwner === undefined ? {} : { leaseOwner }),
+    ...(leaseUntil === undefined ? {} : { leaseUntil }),
+    ...(leaseToken === undefined ? {} : { leaseToken }),
+    reservedTokens: numeric(row.reserved_tokens),
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(latencyMs === undefined ? {} : { latencyMs }),
+    ...(requestAttempts === undefined ? {} : { requestAttempts }),
+    ...(errorCategory === undefined
+      ? {}
+      : { errorCategory: errorCategory as LlmErrorCategory }),
+    ...(error === undefined ? {} : { error }),
+    ...(retryable === undefined ? {} : { retryable: retryable === 1 }),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(completedAt === undefined ? {} : { completedAt }),
     createdAt: requiredString(row.created_at),
     updatedAt: requiredString(row.updated_at),
   };

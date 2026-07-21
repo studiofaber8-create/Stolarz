@@ -5,6 +5,11 @@ const elements = {
   groupCount: document.querySelector("#group-count"),
   queuedCount: document.querySelector("#queued-count"),
   reviewCount: document.querySelector("#review-count"),
+  llmQueuedCount: document.querySelector("#llm-queued-count"),
+  llmTokenCount: document.querySelector("#llm-token-count"),
+  llmBudgetStatus: document.querySelector("#llm-budget-status"),
+  llmRuns: document.querySelector("#llm-runs"),
+  llmRunsEmpty: document.querySelector("#llm-runs-empty"),
   agentStatus: document.querySelector("#agent-status"),
   testLlm: document.querySelector("#test-llm"),
   accounts: document.querySelector("#accounts"),
@@ -267,6 +272,39 @@ function renderScans(scans, groups) {
   }
 }
 
+function renderLlmRuns(runs, queue, configured, replayEnabled) {
+  elements.llmRuns.replaceChildren();
+  elements.llmRunsEmpty.classList.toggle("hidden", runs.length > 0);
+  elements.llmQueuedCount.textContent = String(queue.queued + queue.running);
+  elements.llmTokenCount.textContent = Number(queue.tokensToday).toLocaleString("pl-PL");
+  elements.llmBudgetStatus.textContent = configured
+    ? `aktywne ${queue.running} · błędy ${queue.failed} · pominięte przez budżet ${queue.skippedBudget}`
+    : "LLM nie jest skonfigurowany";
+  for (const run of runs.slice(0, 30)) {
+    const card = node("article", "feed-card compact card");
+    card.dataset.llmRunId = run.id;
+    const heading = node("div", "group-heading");
+    heading.append(
+      node("div", "scan-line", `${run.operation} · ${run.promptVersion}`),
+      node("span", `badge ${statusClass(run.status)}`, run.status),
+    );
+    card.append(
+      heading,
+      node("p", "muted", `${run.model} · próba ${run.attempts}/${run.maxAttempts} · rezerwa ${run.reservedTokens} tokenów`),
+      node("p", "muted", `wejście ${run.inputTokens ?? "—"} · wyjście ${run.outputTokens ?? "—"} · ${run.latencyMs ?? "—"} ms`),
+    );
+    if (run.errorCategory || run.error) {
+      card.append(node("p", "error-text", `${run.errorCategory ?? "błąd"}: ${run.error ?? "brak szczegółów"}`));
+    }
+    if (replayEnabled && (run.status === "failed" || run.status === "skipped_budget")) {
+      const actions = node("div", "account-actions");
+      actions.append(actionButton("replay", "Ponów operację", "secondary"));
+      card.append(actions);
+    }
+    elements.llmRuns.append(card);
+  }
+}
+
 function renderAudit(events) {
   elements.audit.replaceChildren();
   elements.auditEmpty.classList.toggle("hidden", events.length > 0);
@@ -296,7 +334,11 @@ function actionButton(action, label, className = "") {
 }
 
 function statusClass(status) {
-  return status === "succeeded" ? "success" : status === "failed" || status === "auth_required" ? "failure" : "neutral";
+  return status === "succeeded"
+    ? "success"
+    : status === "failed" || status === "auth_required" || status === "skipped_budget"
+      ? "failure"
+      : "neutral";
 }
 
 function extractionStatusClass(status) {
@@ -326,6 +368,12 @@ async function refresh() {
       overview.responseDrafts,
     );
     renderScans(overview.recentScans, overview.groups);
+    renderLlmRuns(
+      overview.recentLlmRuns,
+      overview.llmQueue,
+      overview.llm.configured,
+      overview.llmReplayEnabled,
+    );
     renderAudit(overview.recentAudit);
     elements.queuedCount.textContent = String(overview.monitoring.queuedJobs);
     elements.agentStatus.textContent = `${overview.worker.running ? "worker on" : "worker off"} · ${overview.llm.configured ? overview.llm.model : "LLM off"}`;
@@ -471,6 +519,26 @@ elements.templates.addEventListener("click", async (event) => {
       if (!window.confirm("Usunąć szablon? Istniejące wersje robocze zachowają treść.")) return;
       await api(`/api/response-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" });
     }
+    await refresh();
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+elements.llmRuns.addEventListener("click", async (event) => {
+  const button = event.target.closest('button[data-action="replay"]');
+  if (!button) return;
+  const runId = button.closest("[data-llm-run-id]").dataset.llmRunId;
+  if (!window.confirm("Ponowić tę operację LLM? Zostanie ponownie sprawdzona pod kątem budżetu i aktualności danych.")) return;
+  button.disabled = true;
+  try {
+    await api(`/api/llm-runs/${encodeURIComponent(runId)}/replay`, {
+      method: "POST",
+      body: "{}",
+    });
+    showNotice("Operacja LLM wróciła do trwałej kolejki.");
     await refresh();
   } catch (error) {
     showNotice(error.message, true);

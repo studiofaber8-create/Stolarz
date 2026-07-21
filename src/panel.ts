@@ -10,6 +10,7 @@ import express, {
 } from "express";
 import { CamofoxRequestError } from "./camofox/client.js";
 import type { CamofoxTab } from "./camofox/types.js";
+import type { LlmRun } from "./domain/monitoring.js";
 import { FACEBOOK_EXTRACTOR_VERSION } from "./facebook/facebook-extractor.js";
 import { LlmRequestError } from "./llm/custom-llm-client.js";
 import { createServices, type Services } from "./services.js";
@@ -53,6 +54,34 @@ function tabView(tab: CamofoxTab): object {
     id: tab.id,
     ...(tab.url === undefined ? {} : { url: tab.url }),
     ...(tab.title === undefined ? {} : { title: tab.title }),
+  };
+}
+
+function llmRunView(run: LlmRun): object {
+  return {
+    id: run.id,
+    operation: run.operation,
+    entityId: run.entityId,
+    groupId: run.groupId,
+    ...(run.scanId === undefined ? {} : { scanId: run.scanId }),
+    ...(run.templateId === undefined ? {} : { templateId: run.templateId }),
+    model: run.model,
+    promptVersion: run.promptVersion,
+    status: run.status,
+    attempts: run.attempts,
+    maxAttempts: run.maxAttempts,
+    availableAt: run.availableAt,
+    reservedTokens: run.reservedTokens,
+    ...(run.inputTokens === undefined ? {} : { inputTokens: run.inputTokens }),
+    ...(run.outputTokens === undefined ? {} : { outputTokens: run.outputTokens }),
+    ...(run.latencyMs === undefined ? {} : { latencyMs: run.latencyMs }),
+    ...(run.requestAttempts === undefined ? {} : { requestAttempts: run.requestAttempts }),
+    ...(run.errorCategory === undefined ? {} : { errorCategory: run.errorCategory }),
+    ...(run.error === undefined ? {} : { error: run.error.slice(0, 500) }),
+    ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }),
+    ...(run.completedAt === undefined ? {} : { completedAt: run.completedAt }),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
   };
 }
 
@@ -121,6 +150,9 @@ export function createPanelApp(services: Services = createServices()): express.E
         pollIntervalMs: config.agent.pollIntervalMs,
         leaseMs: config.agent.leaseMs,
         reviewThreshold: config.agent.reviewThreshold,
+        llmDailyTokenBudget: config.agent.llmDailyTokenBudget,
+        llmScanTokenBudget: config.agent.llmScanTokenBudget,
+        llmRunMaxAttempts: config.agent.llmRunMaxAttempts,
         businessDescription: config.agent.businessDescription,
       },
       llm:
@@ -131,6 +163,10 @@ export function createPanelApp(services: Services = createServices()): express.E
               apiUrl: config.llm.apiUrl,
               model: config.llm.model,
               format: config.llm.format,
+              timeoutMs: config.llm.timeoutMs,
+              maxAttempts: config.llm.maxAttempts,
+              retryBaseMs: config.llm.retryBaseMs,
+              retryMaxMs: config.llm.retryMaxMs,
             },
     });
   });
@@ -169,6 +205,22 @@ export function createPanelApp(services: Services = createServices()): express.E
     });
   });
 
+  app.get("/api/llm-health", (_request, response) => {
+    response.json({
+      configured: llm !== undefined,
+      replayEnabled: config.panelApiToken !== undefined,
+      model: llm?.metadata.model,
+      budgets: {
+        dailyTokens: config.agent.llmDailyTokenBudget,
+        perScanTokens: config.agent.llmScanTokenBudget,
+        runMaxAttempts: config.agent.llmRunMaxAttempts,
+      },
+      summary: store.llmQueueSummary(),
+      recentRuns: store.listLlmRuns(100).map(llmRunView),
+      checkedAt: new Date().toISOString(),
+    });
+  });
+
   app.get("/api/overview", async (_request, response) => {
     const [healthResult, accountResult] = await Promise.allSettled([
       sessions.health(),
@@ -196,6 +248,9 @@ export function createPanelApp(services: Services = createServices()): express.E
         accountResult.status === "rejected" ? errorMessage(accountResult.reason) : undefined,
       llm:
         llm === undefined ? { configured: false } : { configured: true, ...llm.metadata },
+      llmQueue: store.llmQueueSummary(),
+      llmReplayEnabled: config.panelApiToken !== undefined,
+      recentLlmRuns: store.listLlmRuns(30).map(llmRunView),
       worker: worker.status(),
       monitoring: store.summary(),
       groups: store.listGroups(),
@@ -222,6 +277,16 @@ export function createPanelApp(services: Services = createServices()): express.E
       latencyMs: result.latencyMs,
       usage: result.usage,
     });
+  });
+
+  app.post("/api/llm-runs/:runId/replay", (request, response) => {
+    if (config.panelApiToken === undefined) {
+      response.status(409).json({
+        error: "PANEL_API_TOKEN is required for cost-incurring LLM replay operations",
+      });
+      return;
+    }
+    response.status(202).json(llmRunView(store.replayLlmRun(request.params.runId ?? "")));
   });
 
   app.get("/api/accounts", async (_request, response) => {
@@ -469,6 +534,10 @@ export function createPanelApp(services: Services = createServices()): express.E
     response.json(store.listJobs(queryLimit(request)));
   });
 
+  app.get("/api/llm-runs", (request, response) => {
+    response.json(store.listLlmRuns(queryLimit(request)).map(llmRunView));
+  });
+
   app.get("/api/audit", (request, response) => {
     response.json(store.listAuditEvents(queryLimit(request)));
   });
@@ -491,7 +560,8 @@ export function createPanelApp(services: Services = createServices()): express.E
             message.startsWith("Unknown scan:") ||
             message.startsWith("Unknown job:") ||
             message.startsWith("Unknown decision:") ||
-            message.startsWith("Unknown response template:")
+            message.startsWith("Unknown response template:") ||
+            message.startsWith("Unknown LLM run:")
           ? 404
           : message.startsWith("Account already exists:") ||
               message.startsWith("Camofox profile already exists:") ||
@@ -504,7 +574,9 @@ export function createPanelApp(services: Services = createServices()): express.E
               message.startsWith("Account requires authenticated recovery:") ||
               message.startsWith("Account recovery requires authenticated inspection:") ||
               message.startsWith("Group is disabled:") ||
-              message.startsWith("Response template name already exists:")
+              message.startsWith("Group has active LLM runs:") ||
+              message.startsWith("Response template name already exists:") ||
+              message.startsWith("LLM run cannot be replayed from status:")
             ? 409
             : message.includes("must") || message.startsWith("Invalid ")
               ? 400
